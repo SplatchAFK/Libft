@@ -43,11 +43,12 @@ cc main.c -L. -lft -o mon_programme
 
 - Les man pages officielles des fonctions originales (man strlen, man memcpy, man ar, etc.) pour comprendre le comportement attendu de chaque fonction avant de la recoder. Et avoir le vrai prototype.
 - La documentation de make pour la construction du Makefile.
+- Internet (Wikipedia pour les notions (memoire, fonctionnement stack/heap) / stackoverflow / geeksforgeeks.org...)
 
 ### Utilisation de l'IA
 
 J'ai utilisé Claude Code comme tuteur pendant ce projet, pas pour avoir des réponses toutes faites mais pour comprendre des concepts que je ne maîtrisais pas encore.
 
-Le code des fonctions a été écrit par moi.
+Le code des fonctions a été entierement écrit par moi.
 
-version=v1
+version=v2
