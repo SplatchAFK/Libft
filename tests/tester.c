@@ -1,48 +1,29 @@
-/* Libft tester - not part of the submission. Run: bash tests/run.sh */
+/* Libft tester v2 - not part of the submission.
+** One binary per function, built with ASan + UBSan + LeakSanitizer.
+** Run from the repository root:  bash tests/run.sh [ft_name ...]
+**
+** Protocol with run.sh: failures are printed as "  ko| <message>" and the
+** last line is "@@ <checks> <failures>". Sanitizer reports go to a log file.
+*/
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <setjmp.h>
-#include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "libft.h"
 
-#define GREEN "\033[32m"
-#define RED "\033[31m"
-#define YELLOW "\033[33m"
-#define RESET "\033[0m"
-#define MAX_SHOWN 5
-#define UNUSED __attribute__((unused))
-
-#ifndef O_BINARY
-# define O_BINARY 0
-#endif
-#ifdef _WIN32
-# define JMPBUF jmp_buf
-# define SETJMP(b) setjmp(b)
-# define LONGJMP(b, v) longjmp(b, v)
-# define FD_TMP "libft_tester_fd.tmp"
-#else
-# define JMPBUF sigjmp_buf
-# define SETJMP(b) sigsetjmp(b, 1)
-# define LONGJMP(b, v) siglongjmp(b, v)
-# define FD_TMP "/tmp/libft_tester_fd.tmp"
-#endif
-
-static JMPBUF		g_jmp;
-static const char	*g_name = "";
-static int			g_cases = 0;
-static int			g_fail = 0;
-static int			g_ok = 0;
-static int			g_ko = 0;
-static int			g_crash = 0;
-static int			g_skip = 0;
+#define MAX_SHOWN 8
+#define COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
 /* ------------------------------ framework ------------------------------ */
+
+static int	g_checks;
+static int	g_fails;
 
 static void	check(int ok, const char *fmt, ...)
 	__attribute__((format(printf, 2, 3)));
@@ -51,1297 +32,1818 @@ static void	check(int ok, const char *fmt, ...)
 {
 	va_list	ap;
 
-	g_cases++;
+	g_checks++;
 	if (ok)
 		return ;
-	g_fail++;
-	if (g_fail > MAX_SHOWN)
+	g_fails++;
+	if (g_fails > MAX_SHOWN)
 		return ;
-	printf("     %s: ", g_name);
+	printf("  ko| ");
 	va_start(ap, fmt);
 	vprintf(fmt, ap);
 	va_end(ap);
 	printf("\n");
 }
 
-static void	on_crash(int sig)
+/* Escaped, truncated rendering of n bytes (rotating buffers). */
+static const char	*show(const void *p, size_t n)
 {
-	(void)sig;
-	LONGJMP(g_jmp, 1);
-}
+	static char			buf[8][220];
+	static int			w;
+	const unsigned char	*s;
+	char				*o;
+	size_t				i;
+	size_t				k;
 
-static void	run(const char *name, void (*fn)(void))
-{
-	volatile int	crashed;
-
-	g_name = name;
-	g_cases = 0;
-	g_fail = 0;
-	crashed = 0;
-	signal(SIGSEGV, on_crash);
-	signal(SIGABRT, on_crash);
-#ifdef SIGBUS
-	signal(SIGBUS, on_crash);
-#endif
-	if (SETJMP(g_jmp) == 0)
-		fn();
-	else
-		crashed = 1;
-	if (crashed)
+	o = buf[w++ & 7];
+	if (p == NULL)
+		return (strcpy(o, "(null)"));
+	s = p;
+	k = 0;
+	for (i = 0; i < n && k < 180; i++)
 	{
-		printf(RED "[CRASH]" RESET " %-18s crashed after %d checks\n", name,
-			g_cases);
-		g_crash++;
+		if (s[i] == '\n')
+			k += sprintf(o + k, "\\n");
+		else if (s[i] == '\t')
+			k += sprintf(o + k, "\\t");
+		else if (s[i] == '\\')
+			k += sprintf(o + k, "\\\\");
+		else if (s[i] < 32 || s[i] > 126)
+			k += sprintf(o + k, "\\x%02x", s[i]);
+		else
+			o[k++] = s[i];
 	}
-	else if (g_fail == 0)
-	{
-		printf(GREEN "[OK]   " RESET " %-18s %d checks\n", name, g_cases);
-		g_ok++;
-	}
-	else
-	{
-		printf(RED "[KO]   " RESET " %-18s %d/%d checks failed\n", name,
-			g_fail, g_cases);
-		g_ko++;
-	}
-	fflush(stdout);
+	if (i < n)
+		k += sprintf(o + k, "...");
+	o[k] = '\0';
+	return (o);
 }
+#define S(x) show((x), (x) ? strlen(x) : 0)
 
-UNUSED static void	skip(const char *name)
-{
-	printf(YELLOW "[--]   " RESET " %-18s file not found\n", name);
-	g_skip++;
-}
-
-UNUSED static int	sgn(int x)
+static int	sgn(long x)
 {
 	return ((x > 0) - (x < 0));
 }
 
-/* --------------------------- Part 1 : ctype ---------------------------- */
+/* Allocation used by the tester itself: never fails, never counted. */
+void		*__real_malloc(size_t n);
 
-UNUSED static void	ctype_bool(int (*mine)(int), int (*real)(int))
+static void	*xalloc(size_t n)
+{
+	return (__real_malloc(n ? n : 1));
+}
+
+/* Exact-size copies: any read or write past the end is caught by ASan. */
+static char	*xdup(const char *s)
+{
+	size_t	n;
+	char	*p;
+
+	n = strlen(s) + 1;
+	p = __real_malloc(n);
+	memcpy(p, s, n);
+	return (p);
+}
+
+static void	*xbytes(const void *s, size_t n)
+{
+	void	*p;
+
+	p = __real_malloc(n);
+	memcpy(p, s, n);
+	return (p);
+}
+
+/* malloc fault injection: only the libft code goes through __wrap_malloc. */
+static int	g_inj_on;
+static int	g_inj_cnt;
+static int	g_inj_at;
+
+void	*__wrap_malloc(size_t n)
+{
+	if (g_inj_on && ++g_inj_cnt == g_inj_at)
+		return (NULL);
+	return (__real_malloc(n));
+}
+
+static void	inject_on(int k)
+{
+	g_inj_cnt = 0;
+	g_inj_at = k;
+	g_inj_on = 1;
+}
+
+static int	inject_off(void)
+{
+	g_inj_on = 0;
+	return (g_inj_cnt >= g_inj_at);
+}
+
+/* ------------------------------ ctype ---------------------------------- */
+
+static void	ctype_bool(const char *n, int (*mine)(int), int (*real)(int))
 {
 	int	c;
 	int	a;
 	int	b;
 
-	c = -1;
-	while (c <= 255)
+	for (c = -1; c <= 255; c++)
 	{
 		a = mine(c);
 		b = (real(c) != 0);
-		check(a == b, "c=%d mine=%d expected=%d (must be exactly 0 or 1)",
-			c, a, b);
-		c++;
+		check(a == b, "%s(%d) = %d, expected exactly %d", n, c, a, b);
 	}
 }
 
-UNUSED static void	ctype_conv(int (*mine)(int), int (*real)(int))
+static void	ctype_conv(const char *n, int (*mine)(int), int (*real)(int))
 {
 	int	c;
 
-	c = -1;
-	while (c <= 255)
-	{
-		check(mine(c) == real(c), "c=%d mine=%d libc=%d", c, mine(c),
-			real(c));
-		c++;
-	}
+	for (c = -1; c <= 255; c++)
+		check(mine(c) == real(c), "%s(%d) = %d, libc says %d", n, c,
+			mine(c), real(c));
 }
 
-#ifdef HAVE_isalpha
-static void	t_isalpha(void) { ctype_bool(ft_isalpha, isalpha); }
-# define T_isalpha run("ft_isalpha", t_isalpha)
-#else
-# define T_isalpha skip("ft_isalpha")
+#define REAL(f) static int r_##f(int c) { return (f(c)); }
+REAL(isalpha) REAL(isdigit) REAL(isalnum) REAL(isascii) REAL(isprint)
+REAL(toupper) REAL(tolower)
+
+#ifdef T_isalpha
+static void	run_test(void) { ctype_bool("ft_isalpha", ft_isalpha, r_isalpha); }
+#endif
+#ifdef T_isdigit
+static void	run_test(void) { ctype_bool("ft_isdigit", ft_isdigit, r_isdigit); }
+#endif
+#ifdef T_isalnum
+static void	run_test(void) { ctype_bool("ft_isalnum", ft_isalnum, r_isalnum); }
+#endif
+#ifdef T_isascii
+static void	run_test(void) { ctype_bool("ft_isascii", ft_isascii, r_isascii); }
+#endif
+#ifdef T_isprint
+static void	run_test(void) { ctype_bool("ft_isprint", ft_isprint, r_isprint); }
+#endif
+#ifdef T_toupper
+static void	run_test(void) { ctype_conv("ft_toupper", ft_toupper, r_toupper); }
+#endif
+#ifdef T_tolower
+static void	run_test(void) { ctype_conv("ft_tolower", ft_tolower, r_tolower); }
 #endif
 
-#ifdef HAVE_isdigit
-static void	t_isdigit(void) { ctype_bool(ft_isdigit, isdigit); }
-# define T_isdigit run("ft_isdigit", t_isdigit)
-#else
-# define T_isdigit skip("ft_isdigit")
-#endif
+/* ------------------------------ strlen --------------------------------- */
 
-#ifdef HAVE_isalnum
-static void	t_isalnum(void) { ctype_bool(ft_isalnum, isalnum); }
-# define T_isalnum run("ft_isalnum", t_isalnum)
-#else
-# define T_isalnum skip("ft_isalnum")
-#endif
-
-#ifdef HAVE_isascii
-static void	t_isascii(void) { ctype_bool(ft_isascii, isascii); }
-# define T_isascii run("ft_isascii", t_isascii)
-#else
-# define T_isascii skip("ft_isascii")
-#endif
-
-#ifdef HAVE_isprint
-static void	t_isprint(void) { ctype_bool(ft_isprint, isprint); }
-# define T_isprint run("ft_isprint", t_isprint)
-#else
-# define T_isprint skip("ft_isprint")
-#endif
-
-#ifdef HAVE_toupper
-static void	t_toupper(void) { ctype_conv(ft_toupper, toupper); }
-# define T_toupper run("ft_toupper", t_toupper)
-#else
-# define T_toupper skip("ft_toupper")
-#endif
-
-#ifdef HAVE_tolower
-static void	t_tolower(void) { ctype_conv(ft_tolower, tolower); }
-# define T_tolower run("ft_tolower", t_tolower)
-#else
-# define T_tolower skip("ft_tolower")
-#endif
-
-/* -------------------------- Part 1 : strings --------------------------- */
-
-#ifdef HAVE_strlen
-static void	t_strlen(void)
+#ifdef T_strlen
+static void	run_test(void)
 {
-	static char	big[5001];
-	const char	*tab[8];
-	int			i;
+	static const char	*tab[] = {"", "a", "ab", "hello world", "  42\n\t",
+		"\xff\xfe\x80", "tab\there", "ab\0cd"};
+	char				*p;
+	size_t				i;
+	int					k;
 
-	memset(big, 'x', 5000);
-	big[5000] = '\0';
-	tab[0] = "";
-	tab[1] = "a";
-	tab[2] = "abc";
-	tab[3] = "hello world";
-	tab[4] = "  42\n\t";
-	tab[5] = "ab\0cd";
-	tab[6] = "\xff\xfe";
-	tab[7] = big;
-	i = 0;
-	while (i < 8)
+	for (k = 0; k < COUNT(tab); k++)
 	{
-		check(ft_strlen(tab[i]) == strlen(tab[i]), "case %d mine=%zu libc=%zu",
-			i, ft_strlen(tab[i]), strlen(tab[i]));
-		i++;
-	}
-}
-# define T_strlen run("ft_strlen", t_strlen)
-#else
-# define T_strlen skip("ft_strlen")
-#endif
-
-#if defined(HAVE_strchr) || defined(HAVE_strrchr)
-static void	chr_loop(char *(*mine)(const char *, int),
-		char *(*real)(const char *, int))
-{
-	const char	*tab[7];
-	int			i;
-	int			c;
-
-	tab[0] = "";
-	tab[1] = "a";
-	tab[2] = "aaa";
-	tab[3] = "hello";
-	tab[4] = "hello world";
-	tab[5] = "42 Paris\n";
-	tab[6] = "abcabcabc";
-	i = 0;
-	while (i < 7)
-	{
-		c = -1;
-		while (c <= 511)
-		{
-			check(mine(tab[i], c) == real(tab[i], c),
-				"s=\"%s\" c=%d mine=%p libc=%p", tab[i], c,
-				(void *)mine(tab[i], c), (void *)real(tab[i], c));
-			c++;
-		}
-		i++;
-	}
-}
-
-static char	*real_strchr(const char *s, int c) { return (strchr(s, c)); }
-static char	*real_strrchr(const char *s, int c) { return (strrchr(s, c)); }
-#endif
-
-#ifdef HAVE_strchr
-static void	t_strchr(void) { chr_loop(ft_strchr, real_strchr); (void)real_strrchr; }
-# define T_strchr run("ft_strchr", t_strchr)
-#else
-# define T_strchr skip("ft_strchr")
-#endif
-
-#ifdef HAVE_strrchr
-static void	t_strrchr(void) { chr_loop(ft_strrchr, real_strrchr); (void)real_strchr; }
-# define T_strrchr run("ft_strrchr", t_strrchr)
-#else
-# define T_strrchr skip("ft_strrchr")
-#endif
-
-#ifdef HAVE_strncmp
-static void	t_strncmp(void)
-{
-	const char	*a[] = {"abc", "abc", "abd", "abc", "abcd", "", "", "a",
-		"\xff", "a", "abc\0x", "test\200", "Hello", NULL};
-	const char	*b[] = {"abc", "abd", "abc", "abcd", "abc", "", "a", "",
-		"a", "\xff", "abc\0y", "test\0", "hello", NULL};
-	size_t		n[] = {0, 1, 2, 3, 4, 5, 10};
-	int			i;
-	int			j;
-
-	i = 0;
-	while (a[i])
-	{
-		j = 0;
-		while (j < 7)
-		{
-			check(sgn(ft_strncmp(a[i], b[i], n[j])) == sgn(strncmp(a[i], b[i],
-						n[j])), "pair %d n=%zu mine=%d libc=%d (sign must match)",
-				i, n[j], ft_strncmp(a[i], b[i], n[j]), strncmp(a[i], b[i],
-					n[j]));
-			j++;
-		}
-		i++;
-	}
-}
-# define T_strncmp run("ft_strncmp", t_strncmp)
-#else
-# define T_strncmp skip("ft_strncmp")
-#endif
-
-#ifdef HAVE_strlcpy
-static void	t_strlcpy(void)
-{
-	const char	*src[] = {"hello", "hello", "hello", "hello", "hello", "",
-		"a"};
-	size_t		size[] = {10, 6, 5, 3, 1, 5, 2};
-	const char	*exp[] = {"hello", "hello", "hell", "he", "", "", "a"};
-	char		buf[16];
-	size_t		ret;
-	int			i;
-
-	i = 0;
-	while (i < 7)
-	{
-		memset(buf, 'X', 15);
-		buf[15] = '\0';
-		ret = ft_strlcpy(buf, src[i], size[i]);
-		check(ret == strlen(src[i]), "src=\"%s\" size=%zu return=%zu expected=%zu",
-			src[i], size[i], ret, strlen(src[i]));
-		check(strcmp(buf, exp[i]) == 0, "src=\"%s\" size=%zu dst=\"%s\" expected=\"%s\"",
-			src[i], size[i], buf, exp[i]);
-		check(buf[size[i]] == 'X', "src=\"%s\" size=%zu wrote past dstsize",
-			src[i], size[i]);
-		i++;
-	}
-	memset(buf, 'X', 15);
-	buf[15] = '\0';
-	ret = ft_strlcpy(buf, "hello", 0);
-	check(ret == 5, "size=0 return=%zu expected=5", ret);
-	check(strcmp(buf, "XXXXXXXXXXXXXXX") == 0, "size=0 must not write to dst");
-}
-# define T_strlcpy run("ft_strlcpy", t_strlcpy)
-#else
-# define T_strlcpy skip("ft_strlcpy")
-#endif
-
-#ifdef HAVE_strlcat
-static void	t_strlcat(void)
-{
-	const char	*dst[] = {"abc", "abc", "abc", "abc", "abc", "abc", "abc",
-		"abc", "", "", "abc", ""};
-	const char	*src[] = {"def", "def", "def", "def", "def", "def", "def",
-		"def", "xyz", "xyz", "", ""};
-	size_t		size[] = {20, 7, 6, 5, 4, 3, 2, 0, 4, 1, 10, 5};
-	size_t		eret[] = {6, 6, 6, 6, 6, 6, 5, 3, 3, 3, 3, 0};
-	const char	*exp[] = {"abcdef", "abcdef", "abcde", "abcd", "abc", "abc",
-		"abc", "abc", "xyz", "", "abc", ""};
-	char		buf[30];
-	size_t		ret;
-	int			i;
-
-	i = 0;
-	while (i < 12)
-	{
-		memset(buf, 'X', 30);
-		strcpy(buf, dst[i]);
-		ret = ft_strlcat(buf, src[i], size[i]);
-		check(ret == eret[i], "dst=\"%s\" src=\"%s\" size=%zu return=%zu expected=%zu",
-			dst[i], src[i], size[i], ret, eret[i]);
-		check(strcmp(buf, exp[i]) == 0,
-			"dst=\"%s\" src=\"%s\" size=%zu result=\"%s\" expected=\"%s\"",
-			dst[i], src[i], size[i], buf, exp[i]);
-		check(buf[29] == 'X' && buf[25] == 'X', "wrote far past the buffer");
-		i++;
-	}
-}
-# define T_strlcat run("ft_strlcat", t_strlcat)
-#else
-# define T_strlcat skip("ft_strlcat")
-#endif
-
-#ifdef HAVE_strnstr
-static void	t_strnstr(void)
-{
-	const char	*h[] = {"hello world", "hello world", "hello world", "hello",
-		"hello", "hello", "hello", "", "", "aaab", "abc", "hello", "hello",
-		"hello world", "abcabcd"};
-	const char	*n[] = {"world", "world", "", "hello", "hello", "lo", "lo", "",
-		"a", "aab", "abcd", "h", "", "o w", "abcd"};
-	size_t		len[] = {11, 10, 5, 5, 4, 5, 4, 0, 5, 4, 10, 0, 0, 20, 7};
-	int			idx[] = {6, -1, 0, 0, -1, 3, -1, 0, -1, 1, -1, -1, 0, 4, 3};
-	char		*res;
-	int			i;
-
-	i = 0;
-	while (i < 15)
-	{
-		res = ft_strnstr(h[i], n[i], len[i]);
-		if (idx[i] < 0)
-			check(res == NULL, "big=\"%s\" little=\"%s\" len=%zu expected NULL",
-				h[i], n[i], len[i]);
-		else
-			check(res == h[i] + idx[i],
-				"big=\"%s\" little=\"%s\" len=%zu expected index %d, got %s",
-				h[i], n[i], len[i], idx[i], res ? "another address" : "NULL");
-		i++;
-	}
-}
-# define T_strnstr run("ft_strnstr", t_strnstr)
-#else
-# define T_strnstr skip("ft_strnstr")
-#endif
-
-#ifdef HAVE_atoi
-static void	t_atoi(void)
-{
-	const char	*tab[] = {"0", "42", "-42", "+42", "   42", " \t\n\v\f\r42",
-		"2147483647", "-2147483648", "42abc", "abc", "", "--42", "+-42",
-		"-+42", "  -0012", "4 2", " + 42", "-", "+", "  -", "0000", "-0",
-		"\t-2147483648xyz", "9", "-9", NULL};
-	int			i;
-
-	i = 0;
-	while (tab[i])
-	{
-		check(ft_atoi(tab[i]) == atoi(tab[i]), "str=\"%s\" mine=%d libc=%d",
-			tab[i], ft_atoi(tab[i]), atoi(tab[i]));
-		i++;
-	}
-}
-# define T_atoi run("ft_atoi", t_atoi)
-#else
-# define T_atoi skip("ft_atoi")
-#endif
-
-/* --------------------------- Part 1 : memory --------------------------- */
-
-#ifdef HAVE_memset
-static void	t_memset(void)
-{
-	unsigned char	a[40];
-	unsigned char	b[40];
-	int				vals[] = {0, 'A', 255, 300, -1};
-	size_t			lens[] = {0, 1, 7, 32};
-	int				i;
-	int				j;
-	void			*ret;
-
-	i = 0;
-	while (i < 5)
-	{
-		j = 0;
-		while (j < 4)
-		{
-			memset(a, '#', 40);
-			memset(b, '#', 40);
-			ret = ft_memset(a + 4, vals[i], lens[j]);
-			memset(b + 4, vals[i], lens[j]);
-			check(ret == a + 4, "c=%d len=%zu return value is not dest",
-				vals[i], lens[j]);
-			check(memcmp(a, b, 40) == 0, "c=%d len=%zu wrong bytes", vals[i],
-				lens[j]);
-			j++;
-		}
-		i++;
-	}
-}
-# define T_memset run("ft_memset", t_memset)
-#else
-# define T_memset skip("ft_memset")
-#endif
-
-#ifdef HAVE_bzero
-static void	t_bzero(void)
-{
-	unsigned char	a[40];
-	size_t			lens[] = {0, 1, 7, 32};
-	size_t			i;
-	int				j;
-	int				bad;
-
-	j = 0;
-	while (j < 4)
-	{
-		memset(a, '#', 40);
-		ft_bzero(a + 4, lens[j]);
-		bad = 0;
-		i = 0;
-		while (i < 40)
-		{
-			if (i >= 4 && i < 4 + lens[j] && a[i] != 0)
-				bad = 1;
-			if ((i < 4 || i >= 4 + lens[j]) && a[i] != '#')
-				bad = 1;
-			i++;
-		}
-		check(!bad, "n=%zu wrong bytes (not zeroed, or wrote outside)", lens[j]);
-		j++;
-	}
-}
-# define T_bzero run("ft_bzero", t_bzero)
-#else
-# define T_bzero skip("ft_bzero")
-#endif
-
-#ifdef HAVE_memcpy
-static void	t_memcpy(void)
-{
-	const char		*src = "0123456789abcdefghijklmnopqrstuv";
-	unsigned char	a[40];
-	unsigned char	b[40];
-	size_t			lens[] = {0, 1, 5, 32};
-	int				j;
-	void			*ret;
-
-	j = 0;
-	while (j < 4)
-	{
-		memset(a, '#', 40);
-		memset(b, '#', 40);
-		ret = ft_memcpy(a + 4, src, lens[j]);
-		memcpy(b + 4, src, lens[j]);
-		check(ret == a + 4, "n=%zu return value is not dest", lens[j]);
-		check(memcmp(a, b, 40) == 0, "n=%zu wrong bytes", lens[j]);
-		j++;
-	}
-	memcpy(a, "ab\0cd\0ef", 8);
-	memset(b, '#', 40);
-	ft_memcpy(b, a, 8);
-	check(memcmp(a, b, 8) == 0, "must copy bytes after a '\\0' too");
-}
-# define T_memcpy run("ft_memcpy", t_memcpy)
-#else
-# define T_memcpy skip("ft_memcpy")
-#endif
-
-#ifdef HAVE_memmove
-static void	t_memmove(void)
-{
-	size_t	d[] = {2, 0, 0, 5, 1, 0, 8, 3};
-	size_t	s[] = {0, 2, 0, 5, 0, 1, 0, 4};
-	size_t	n[] = {8, 8, 8, 0, 15, 15, 4, 12};
-	char	a[17];
-	char	b[17];
-	void	*ret;
-	int		i;
-
-	i = 0;
-	while (i < 8)
-	{
-		memcpy(a, "0123456789abcdef", 17);
-		memcpy(b, "0123456789abcdef", 17);
-		ret = ft_memmove(a + d[i], a + s[i], n[i]);
-		memmove(b + d[i], b + s[i], n[i]);
-		check(ret == a + d[i], "dst+%zu src+%zu n=%zu return value is not dest",
-			d[i], s[i], n[i]);
-		check(memcmp(a, b, 17) == 0,
-			"dst+%zu src+%zu n=%zu mine=\"%s\" libc=\"%s\" (overlap)", d[i],
-			s[i], n[i], a, b);
-		i++;
-	}
-}
-# define T_memmove run("ft_memmove", t_memmove)
-#else
-# define T_memmove skip("ft_memmove")
-#endif
-
-#ifdef HAVE_memchr
-static void	t_memchr(void)
-{
-	const char	buf[] = "hello\0world\xff!";
-	size_t		n[] = {0, 1, 5, 6, 13};
-	int			c;
-	int			j;
-
-	j = 0;
-	while (j < 5)
-	{
-		c = -1;
-		while (c <= 300)
-		{
-			check(ft_memchr(buf, c, n[j]) == memchr(buf, c, n[j]),
-				"c=%d n=%zu mine=%p libc=%p", c, n[j],
-				ft_memchr(buf, c, n[j]), memchr(buf, c, n[j]));
-			c++;
-		}
-		j++;
-	}
-}
-# define T_memchr run("ft_memchr", t_memchr)
-#else
-# define T_memchr skip("ft_memchr")
-#endif
-
-#ifdef HAVE_memcmp
-static void	t_memcmp(void)
-{
-	const char	a[][9] = {"abcdefgh", "abcdefgh", "abc\0defg", "\xff" "bcdefgh",
-		"a\200cdefgh", "abcdefgh", "\0\0\0\0\0\0\0\1"};
-	const char	b[][9] = {"abcdefgh", "abcdefgX", "abc\0dezg", "\x01" "bcdefgh",
-		"a\0cdefgh", "Abcdefgh", "\0\0\0\0\0\0\0\2"};
-	size_t		n[] = {0, 1, 4, 7, 8};
-	int			i;
-	int			j;
-
-	i = 0;
-	while (i < 7)
-	{
-		j = 0;
-		while (j < 5)
-		{
-			check(sgn(ft_memcmp(a[i], b[i], n[j])) == sgn(memcmp(a[i], b[i],
-						n[j])), "pair %d n=%zu mine=%d libc=%d (sign must match)",
-				i, n[j], ft_memcmp(a[i], b[i], n[j]), memcmp(a[i], b[i],
-					n[j]));
-			j++;
-		}
-		i++;
-	}
-}
-# define T_memcmp run("ft_memcmp", t_memcmp)
-#else
-# define T_memcmp skip("ft_memcmp")
-#endif
-
-#ifdef HAVE_calloc
-static void	t_calloc(void)
-{
-	unsigned char	*p;
-	size_t			i;
-	int				bad;
-
-	p = ft_calloc(250, 4);
-	check(p != NULL, "calloc(250, 4) returned NULL");
-	if (p)
-	{
-		bad = 0;
-		i = 0;
-		while (i < 1000)
-			if (p[i++] != 0)
-				bad = 1;
-		check(!bad, "memory is not zeroed");
-		memset(p, 'A', 1000);
+		p = xdup(tab[k]);
+		check(ft_strlen(p) == strlen(p), "strlen(\"%s\") = %zu, expected %zu",
+			show(p, strlen(p)), ft_strlen(p), strlen(p));
 		free(p);
 	}
-	p = ft_calloc(0, 8);
-	check(p != NULL, "calloc(0, 8) must return a pointer that can be freed");
-	free(p);
-	p = ft_calloc(8, 0);
-	check(p != NULL, "calloc(8, 0) must return a pointer that can be freed");
-	free(p);
-	p = ft_calloc(1, 1);
-	check(p != NULL && p[0] == 0, "calloc(1, 1) wrong");
+	for (i = 0; i < 70; i++)
+	{
+		p = xalloc(i + 1);
+		memset(p, 'x', i);
+		p[i] = '\0';
+		check(ft_strlen(p) == i, "strlen of %zu x's = %zu", i, ft_strlen(p));
+		free(p);
+	}
+	p = xalloc((1 << 20) + 1);
+	memset(p, 'y', 1 << 20);
+	p[1 << 20] = '\0';
+	check(ft_strlen(p) == (1 << 20), "strlen of 1 MiB string = %zu",
+		ft_strlen(p));
 	free(p);
 }
-# define T_calloc run("ft_calloc", t_calloc)
-#else
-# define T_calloc skip("ft_calloc")
 #endif
 
-#ifdef HAVE_strdup
-static void	t_strdup(void)
-{
-	static char	big[2001];
-	const char	*tab[4];
-	char		*d;
-	int			i;
+/* ------------------------- strchr / strrchr ---------------------------- */
 
-	memset(big, 'z', 2000);
-	big[2000] = '\0';
-	tab[0] = "";
-	tab[1] = "hello";
-	tab[2] = "hello world\n\t42";
-	tab[3] = big;
-	i = 0;
-	while (i < 4)
+#if defined(T_strchr) || defined(T_strrchr)
+static char	*r_strchr(const char *s, int c) { return (strchr(s, c)); }
+static char	*r_strrchr(const char *s, int c) { return (strrchr(s, c)); }
+
+static void	chr_loop(const char *n, char *(*mine)(const char *, int),
+		char *(*real)(const char *, int))
+{
+	static const char	*tab[] = {"", "a", "aaa", "hello", "hello world",
+		"42 Paris\n", "abcabcabc", "\xff\xfe\x80", "x\x7f", "a b  c"};
+	char				*p;
+	char				*a;
+	char				*b;
+	int					k;
+	int					c;
+
+	for (k = 0; k < COUNT(tab); k++)
 	{
-		d = ft_strdup(tab[i]);
-		check(d != NULL, "case %d returned NULL", i);
+		p = xdup(tab[k]);
+		for (c = -300; c <= 600; c++)
+		{
+			a = mine(p, c);
+			b = real(p, c);
+			check(a == b, "%s(\"%s\", %d) -> %s, libc -> %s", n, S(p), c,
+				a ? show(a, strlen(a)) : "NULL", b ? show(b, strlen(b)) : "NULL");
+		}
+		free(p);
+	}
+}
+#endif
+#ifdef T_strchr
+static void	run_test(void) { chr_loop("ft_strchr", ft_strchr, r_strchr); }
+#endif
+#ifdef T_strrchr
+static void	run_test(void) { chr_loop("ft_strrchr", ft_strrchr, r_strrchr); }
+#endif
+
+/* ------------------------------ strncmp -------------------------------- */
+
+#ifdef T_strncmp
+static void	run_test(void)
+{
+	static const char	*tab[] = {"", "a", "abc", "abd", "abcd", "ABC", "\xff",
+		"\x80", "a\xff", "test\x80", "test", "Hello", "hello"};
+	static const size_t	ns[] = {0, 1, 2, 3, 4, 5, 6, 7, 100, SIZE_MAX};
+	char				*x;
+	char				*y;
+	int					i;
+	int					j;
+	int					k;
+
+	for (i = 0; i < COUNT(tab); i++)
+		for (j = 0; j < COUNT(tab); j++)
+		{
+			x = xdup(tab[i]);
+			y = xdup(tab[j]);
+			for (k = 0; k < COUNT(ns); k++)
+				check(sgn(ft_strncmp(x, y, ns[k])) == sgn(strncmp(x, y, ns[k])),
+					"strncmp(\"%s\", \"%s\", %zu) = %d, libc %d (sign must match, bytes are unsigned)",
+					S(x), S(y), ns[k], ft_strncmp(x, y, ns[k]),
+					strncmp(x, y, ns[k]));
+			free(x);
+			free(y);
+		}
+}
+#endif
+
+/* ------------------------------ memset / bzero ------------------------- */
+
+#ifdef T_memset
+static void	run_test(void)
+{
+	static const int	vals[] = {0, 'A', 127, 128, 255, 256 + 66, -1, INT_MAX,
+		INT_MIN};
+	unsigned char		a[40];
+	unsigned char		b[40];
+	unsigned char		*p;
+	void				*ret;
+	size_t				off;
+	size_t				n;
+	int					v;
+
+	for (v = 0; v < COUNT(vals); v++)
+	{
+		for (off = 0; off < 6; off += 5)
+			for (n = 0; n + off <= 40; n++)
+			{
+				memset(a, '#', 40);
+				memset(b, '#', 40);
+				ret = ft_memset(a + off, vals[v], n);
+				memset(b + off, vals[v], n);
+				check(ret == a + off, "memset c=%d n=%zu: return is not dest",
+					vals[v], n);
+				check(memcmp(a, b, 40) == 0,
+					"memset(buf+%zu, %d, %zu): wrong bytes", off, vals[v], n);
+			}
+		for (n = 0; n <= 33; n++)
+		{
+			p = xalloc(n);
+			ret = ft_memset(p, vals[v], n);
+			check(ret == p, "memset exact buffer n=%zu: return is not dest", n);
+			free(p);
+		}
+	}
+}
+#endif
+
+#ifdef T_bzero
+static void	run_test(void)
+{
+	unsigned char	a[40];
+	unsigned char	*p;
+	size_t			off;
+	size_t			n;
+	size_t			i;
+	int				bad;
+
+	for (off = 0; off < 6; off += 5)
+		for (n = 0; n + off <= 40; n++)
+		{
+			memset(a, '#', 40);
+			ft_bzero(a + off, n);
+			bad = 0;
+			for (i = 0; i < 40; i++)
+				if ((i >= off && i < off + n && a[i] != 0)
+					|| ((i < off || i >= off + n) && a[i] != '#'))
+					bad = 1;
+			check(!bad, "bzero(buf+%zu, %zu): not zeroed or wrote outside",
+				off, n);
+		}
+	for (n = 0; n <= 33; n++)
+	{
+		p = xalloc(n);
+		memset(p, 0x55, n);
+		ft_bzero(p, n);
+		for (i = 0; i < n; i++)
+			if (p[i] != 0)
+				break ;
+		check(i == n, "bzero exact buffer n=%zu: byte %zu not zero", n, i);
+		free(p);
+	}
+}
+#endif
+
+/* ------------------------------ memcpy --------------------------------- */
+
+#ifdef T_memcpy
+static void	run_test(void)
+{
+	unsigned char	pat[64];
+	unsigned char	big[100];
+	unsigned char	*src;
+	unsigned char	*dst;
+	void			*ret;
+	size_t			n;
+	size_t			i;
+
+	for (i = 0; i < 64; i++)
+		pat[i] = (unsigned char)(i * 7 + (i % 5 == 0 ? 0 : 3));
+	for (n = 0; n <= 64; n++)
+	{
+		src = xbytes(pat, n);
+		dst = xalloc(n);
+		memset(dst, 0x55, n);
+		ret = ft_memcpy(dst, src, n);
+		check(ret == dst, "memcpy n=%zu: return is not dest", n);
+		check(memcmp(dst, pat, n) == 0,
+			"memcpy n=%zu: wrong bytes (does it stop at a '\\0'?)", n);
+		free(src);
+		free(dst);
+		memset(big, 0x55, 100);
+		src = xbytes(pat, n);
+		ft_memcpy(big + 16, src, n);
+		check(memcmp(big + 16, pat, n) == 0, "memcpy into the middle, n=%zu", n);
+		for (i = 0; i < 100; i++)
+			if ((i < 16 || i >= 16 + n) && big[i] != 0x55)
+				break ;
+		check(i == 100, "memcpy n=%zu: touched byte %zu outside the zone", n, i);
+		free(src);
+	}
+}
+#endif
+
+/* ------------------------------ memmove -------------------------------- */
+
+#ifdef T_memmove
+static void	run_test(void)
+{
+	static const size_t	ns[] = {0, 1, 2, 3, 7, 8, 16, 17, 24};
+	unsigned char		a[40];
+	unsigned char		b[40];
+	unsigned char		*s;
+	unsigned char		*d;
+	void				*ret;
+	size_t				i;
+	size_t				si;
+	size_t				di;
+	int					k;
+
+	for (si = 0; si < 16; si++)
+		for (di = 0; di < 16; di++)
+			for (k = 0; k < COUNT(ns); k++)
+			{
+				if (si + ns[k] > 40 || di + ns[k] > 40)
+					continue ;
+				for (i = 0; i < 40; i++)
+					a[i] = b[i] = (unsigned char)(i + 1);
+				ret = ft_memmove(a + di, a + si, ns[k]);
+				memmove(b + di, b + si, ns[k]);
+				check(ret == a + di, "memmove dst+%zu src+%zu n=%zu: return",
+					di, si, ns[k]);
+				check(memcmp(a, b, 40) == 0,
+					"memmove dst+%zu src+%zu n=%zu: wrong bytes (overlap direction)",
+					di, si, ns[k]);
+			}
+	for (i = 0; i <= 40; i++)
+	{
+		for (si = 0; si < 40; si++)
+			a[si] = (unsigned char)(si * 3);
+		s = xbytes(a, i);
+		d = xalloc(i);
+		ft_memmove(d, s, i);
+		check(memcmp(d, a, i) == 0, "memmove between exact buffers n=%zu", i);
+		free(s);
+		free(d);
+	}
+}
+#endif
+
+/* ------------------------------ memchr / memcmp ------------------------ */
+
+#ifdef T_memchr
+static void	run_test(void)
+{
+	static const unsigned char	data[20] = {'h', 'e', 'l', 'l', 'o', 0, 'w',
+		'o', 'r', 0xff, 'l', 'd', 0x80, '!', 'a', 'b', 'c', 'a', 0x7f, 0};
+	unsigned char				*p;
+	size_t						n;
+	int							c;
+
+	for (n = 0; n <= 20; n++)
+	{
+		p = xbytes(data, n);
+		for (c = -300; c <= 600; c++)
+			check(ft_memchr(p, c, n) == memchr(p, c, n),
+				"memchr(buf, %d, %zu) = %p, libc %p", c, n, ft_memchr(p, c, n),
+				memchr(p, c, n));
+		free(p);
+	}
+}
+#endif
+
+#ifdef T_memcmp
+static void	run_test(void)
+{
+	static const unsigned char	a[][9] = {"abcdefgh", "abcdefgh", "abc\0defg",
+		"\xff" "bcdefgh", "a\200cdefgh", "abcdefgh", "\0\0\0\0\0\0\0\1",
+		"abcdefgh", "\x7f" "bcdefgh", "\x01\x02\x03\x04\x05\x06\x07\x08"};
+	static const unsigned char	b[][9] = {"abcdefgh", "abcdefgX", "abc\0dezg",
+		"\x01" "bcdefgh", "a\0cdefgh", "Abcdefgh", "\0\0\0\0\0\0\0\2",
+		"abcdefg", "\x80" "bcdefgh", "\x01\x02\x03\x04\x05\x06\x07\xff"};
+	unsigned char				*x;
+	unsigned char				*y;
+	size_t						n;
+	int							i;
+
+	for (i = 0; i < COUNT(a); i++)
+		for (n = 0; n <= 8; n++)
+		{
+			x = xbytes(a[i], n);
+			y = xbytes(b[i], n);
+			check(sgn(ft_memcmp(x, y, n)) == sgn(memcmp(x, y, n)),
+				"memcmp pair %d n=%zu = %d, libc %d (sign must match, bytes are unsigned)",
+				i, n, ft_memcmp(x, y, n), memcmp(x, y, n));
+			free(x);
+			free(y);
+		}
+}
+#endif
+
+/* ------------------------------ strlcpy / strlcat ---------------------- */
+
+#if defined(T_strlcpy) || defined(T_strlcat)
+static size_t	ref_strlcpy(char *d, const char *s, size_t size)
+{
+	size_t	l;
+	size_t	c;
+
+	l = strlen(s);
+	if (size)
+	{
+		c = (l >= size) ? size - 1 : l;
+		memcpy(d, s, c);
+		d[c] = '\0';
+	}
+	return (l);
+}
+
+static size_t	ref_strlcat(char *d, const char *s, size_t size)
+{
+	size_t	dl;
+	size_t	sl;
+	size_t	c;
+
+	dl = 0;
+	while (dl < size && d[dl])
+		dl++;
+	sl = strlen(s);
+	if (dl == size)
+		return (size + sl);
+	c = (sl > size - dl - 1) ? size - dl - 1 : sl;
+	memcpy(d + dl, s, c);
+	d[dl + c] = '\0';
+	return (dl + sl);
+}
+#endif
+
+#ifdef T_strlcpy
+static void	run_test(void)
+{
+	static const char	*srcs[] = {"", "a", "ab", "hello", "abcdefg", "\xff\x80z"};
+	char				*s;
+	char				*d;
+	char				*r;
+	size_t				size;
+	size_t				a;
+	size_t				b;
+	int					k;
+
+	for (k = 0; k < COUNT(srcs); k++)
+		for (size = 0; size <= 10; size++)
+		{
+			s = xdup(srcs[k]);
+			d = xalloc(size);
+			r = xalloc(size);
+			memset(d, 'X', size);
+			memset(r, 'X', size);
+			a = ft_strlcpy(d, s, size);
+			b = ref_strlcpy(r, s, size);
+			check(a == b, "strlcpy(dst, \"%s\", %zu) returned %zu, expected %zu",
+				S(s), size, a, b);
+			check(memcmp(d, r, size) == 0,
+				"strlcpy(dst, \"%s\", %zu): dst=\"%s\" expected \"%s\"", S(s),
+				size, show(d, size), show(r, size));
+			free(s);
+			free(d);
+			free(r);
+		}
+	s = xalloc(5001);
+	memset(s, 'q', 5000);
+	s[5000] = '\0';
+	d = xalloc(5001);
+	check(ft_strlcpy(d, s, 5001) == 5000 && strcmp(d, s) == 0,
+		"strlcpy of a 5000 chars string");
+	free(s);
+	free(d);
+}
+#endif
+
+#ifdef T_strlcat
+static void	run_test(void)
+{
+	size_t	size;
+	size_t	dl;
+	size_t	sl;
+	size_t	cap;
+	size_t	a;
+	size_t	b;
+	char	*d;
+	char	*r;
+	char	*s;
+
+	for (size = 0; size <= 10; size++)
+		for (dl = 0; dl <= 12; dl++)
+			for (sl = 0; sl <= 6; sl++)
+			{
+				cap = (dl >= size ? dl : size) + 1;
+				d = xalloc(cap);
+				r = xalloc(cap);
+				memset(d, 'X', cap);
+				memset(d, 'D', dl);
+				d[dl] = '\0';
+				memcpy(r, d, cap);
+				s = xalloc(sl + 1);
+				memcpy(s, "abcdef", sl);
+				s[sl] = '\0';
+				a = ft_strlcat(d, s, size);
+				b = ref_strlcat(r, s, size);
+				check(a == b,
+					"strlcat(dst[len %zu], \"%s\", %zu) returned %zu, expected %zu%s",
+					dl, S(s), size, a, b,
+					dl >= size ? " (dst longer than dstsize: return dstsize + len(src), write nothing)" : "");
+				check(memcmp(d, r, cap) == 0,
+					"strlcat(dst[len %zu], \"%s\", %zu): dst=\"%s\" expected \"%s\"",
+					dl, S(s), size, show(d, cap), show(r, cap));
+				free(d);
+				free(r);
+				free(s);
+			}
+}
+#endif
+
+/* ------------------------------ strnstr -------------------------------- */
+
+#ifdef T_strnstr
+static char	*ref_strnstr(const char *h, const char *n, size_t len)
+{
+	size_t	nl;
+	size_t	i;
+
+	nl = strlen(n);
+	if (nl == 0)
+		return ((char *)h);
+	for (i = 0; h[i] && i + nl <= len; i++)
+		if (strncmp(h + i, n, nl) == 0)
+			return ((char *)h + i);
+	return (NULL);
+}
+
+static void	run_test(void)
+{
+	static const char	*hs[] = {"", "a", "aaab", "abcabcd", "hello world",
+		"lorem ipsum dolor sit amet", "mississippi"};
+	static const char	*ns[] = {"", "a", "aa", "aab", "abcd", "ss", "issip",
+		"ppi", "world", "xyz", "mississippi", "mississippix", "o w"};
+	char				*h;
+	char				*n;
+	char				*a;
+	char				*b;
+	size_t				len;
+	int					i;
+	int					j;
+
+	for (i = 0; i < COUNT(hs); i++)
+		for (j = 0; j < COUNT(ns); j++)
+		{
+			h = xdup(hs[i]);
+			n = xdup(ns[j]);
+			for (len = 0; len <= strlen(h) + 2; len++)
+			{
+				a = ft_strnstr(h, n, len);
+				b = ref_strnstr(h, n, len);
+				check(a == b, "strnstr(\"%s\", \"%s\", %zu) -> offset %ld, expected %ld (-1 = NULL)",
+					S(h), S(n), len, a ? (long)(a - h) : -1L,
+					b ? (long)(b - h) : -1L);
+			}
+			a = ft_strnstr(h, n, SIZE_MAX);
+			b = ref_strnstr(h, n, SIZE_MAX);
+			check(a == b, "strnstr(\"%s\", \"%s\", SIZE_MAX) differs", S(h), S(n));
+			free(h);
+			free(n);
+		}
+}
+#endif
+
+/* ------------------------------ atoi ----------------------------------- */
+
+#ifdef T_atoi
+static void	run_test(void)
+{
+	static const char	*tab[] = {"0", "42", "-42", "+42", "   42",
+		" \t\n\v\f\r42", "2147483647", "-2147483648", "42abc", "abc", "",
+		"--42", "+-42", "-+42", "  -0012", "4 2", " + 42", "-", "+", "  -",
+		"0000", "-0", "+0", "\t-2147483648xyz", "9", "-9", "0x1A", "1e5",
+		"\v42", "\f-42", " 12 34", "00000000000000000042",
+		"-00000000000000002147483648", "2147483647abc", "\xff" "42",
+		"42\xff", " ---1", "1-1", "2147483646", "-2147483647"};
+	char				*p;
+	int					i;
+
+	for (i = 0; i < COUNT(tab); i++)
+	{
+		p = xdup(tab[i]);
+		check(ft_atoi(p) == atoi(p), "atoi(\"%s\") = %d, libc %d", S(p),
+			ft_atoi(p), atoi(p));
+		free(p);
+	}
+}
+#endif
+
+/* ------------------------------ calloc / strdup ------------------------ */
+
+#ifdef T_calloc
+static void	expect_null(void *p, const char *msg)
+{
+	check(p == NULL, "%s", msg);
+	free(p);
+}
+
+static void	run_test(void)
+{
+	static const size_t	pairs[][2] = {{0, 0}, {0, 8}, {8, 0}, {1, 1}, {3, 7},
+		{250, 4}, {1000, 1000}, {1, 65536}, {65536, 1}};
+	unsigned char		*p;
+	size_t				i;
+	int					k;
+
+	for (k = 0; k < COUNT(pairs); k++)
+	{
+		p = ft_calloc(pairs[k][0], pairs[k][1]);
+		check(p != NULL, "calloc(%zu, %zu) returned NULL", pairs[k][0],
+			pairs[k][1]);
+		if (p == NULL)
+			continue ;
+		for (i = 0; i < pairs[k][0] * pairs[k][1]; i++)
+			if (p[i] != 0)
+				break ;
+		check(i == pairs[k][0] * pairs[k][1],
+			"calloc(%zu, %zu): byte %zu is not zero", pairs[k][0],
+			pairs[k][1], i);
+		memset(p, 0xAB, pairs[k][0] * pairs[k][1]);
+		free(p);
+	}
+	expect_null(ft_calloc(SIZE_MAX, 2), "calloc(SIZE_MAX, 2) must be NULL");
+	expect_null(ft_calloc(2, SIZE_MAX), "calloc(2, SIZE_MAX) must be NULL");
+	expect_null(ft_calloc(SIZE_MAX, SIZE_MAX),
+		"calloc(SIZE_MAX, SIZE_MAX) must be NULL");
+	expect_null(ft_calloc(SIZE_MAX / 2 + 1, 2),
+		"calloc(SIZE_MAX/2+1, 2) must be NULL (overflow wraps to 0)");
+	expect_null(ft_calloc(2, SIZE_MAX / 2 + 1),
+		"calloc(2, SIZE_MAX/2+1) must be NULL (overflow wraps to 0)");
+	expect_null(ft_calloc((size_t)1 << 32, (size_t)1 << 32),
+		"calloc(2^32, 2^32) must be NULL (overflow wraps to 0)");
+	expect_null(ft_calloc(SIZE_MAX / 2, 3),
+		"calloc(SIZE_MAX/2, 3) must be NULL (overflow)");
+	inject_on(1);
+	p = ft_calloc(4, 4);
+	if (inject_off())
+		check(p == NULL, "calloc must return NULL when malloc fails");
+	free(p);
+}
+#endif
+
+#ifdef T_strdup
+static void	run_test(void)
+{
+	static const char	*tab[] = {"", "a", "hello", "hello world\n\t42",
+		"\xff\x80\x7f"};
+	char				*s;
+	char				*d;
+	char				*big;
+	int					i;
+
+	for (i = 0; i < COUNT(tab); i++)
+	{
+		s = xdup(tab[i]);
+		d = ft_strdup(s);
+		check(d != NULL, "strdup(\"%s\") returned NULL", S(s));
 		if (d)
 		{
-			check(strcmp(d, tab[i]) == 0, "case %d content differs", i);
-			check(d != tab[i], "case %d returned the same pointer (no copy)", i);
+			check(strcmp(d, s) == 0, "strdup(\"%s\") = \"%s\"", S(s),
+				show(d, strlen(d)));
+			check(d != s, "strdup(\"%s\") returned the same pointer", S(s));
 			free(d);
 		}
-		i++;
+		free(s);
 	}
+	big = xalloc(100001);
+	memset(big, 'z', 100000);
+	big[100000] = '\0';
+	d = ft_strdup(big);
+	check(d && strcmp(d, big) == 0, "strdup of 100000 chars");
+	free(d);
+	free(big);
+	s = xdup("fail me");
+	inject_on(1);
+	d = ft_strdup(s);
+	if (inject_off())
+		check(d == NULL, "strdup must return NULL when malloc fails");
+	free(d);
+	free(s);
 }
-# define T_strdup run("ft_strdup", t_strdup)
-#else
-# define T_strdup skip("ft_strdup")
 #endif
 
-/* ------------------------ Part 2 : additional -------------------------- */
+/* ------------------------------ substr --------------------------------- */
 
-#if defined(HAVE_substr) || defined(HAVE_strjoin) || defined(HAVE_strtrim) \
-	|| defined(HAVE_itoa) || defined(HAVE_strmapi)
-static void	expect_str(char *got, const char *exp, const char *label)
+#ifdef T_substr
+static void	run_test(void)
 {
-	check(got != NULL, "%s returned NULL, expected \"%s\"", label, exp);
-	if (got)
+	static const char		*tab[] = {"", "a", "hello", "hello world, 42!"};
+	static const size_t		lens[] = {SIZE_MAX, SIZE_MAX - 1, 1000};
+	static const unsigned	starts[] = {UINT_MAX, UINT_MAX - 1, 1000};
+	char					*s;
+	char					*r;
+	char					exp[64];
+	size_t					sl;
+	size_t					st;
+	size_t					ln;
+	int						k;
+
+	for (k = 0; k < COUNT(tab); k++)
 	{
-		check(strcmp(got, exp) == 0, "%s got \"%s\" expected \"%s\"", label,
-			got, exp);
-		free(got);
+		s = xdup(tab[k]);
+		sl = strlen(s);
+		for (st = 0; st <= sl + 2; st++)
+			for (ln = 0; ln <= sl + 2; ln++)
+			{
+				r = ft_substr(s, (unsigned int)st, ln);
+				if (st >= sl)
+					exp[0] = '\0';
+				else
+				{
+					memcpy(exp, s + st, (ln > sl - st ? sl - st : ln));
+					exp[(ln > sl - st ? sl - st : ln)] = '\0';
+				}
+				check(r != NULL && strcmp(r, exp) == 0,
+					"substr(\"%s\", %zu, %zu) = %s, expected \"%s\"", S(s), st,
+					ln, r ? show(r, strlen(r)) : "NULL", exp);
+				free(r);
+			}
+		for (st = 0; st < 3; st++)
+			for (ln = 0; ln < 3; ln++)
+			{
+				r = ft_substr(s, starts[st], lens[ln]);
+				check(r != NULL && *r == '\0',
+					"substr(\"%s\", %u, %zu) must be an empty string", S(s),
+					starts[st], lens[ln]);
+				free(r);
+				r = ft_substr(s, 0, lens[ln]);
+				check(r != NULL && strcmp(r, s) == 0,
+					"substr(\"%s\", 0, %zu) must be the whole string", S(s),
+					lens[ln]);
+				free(r);
+			}
+		free(s);
 	}
+	s = xdup("fail me");
+	inject_on(1);
+	r = ft_substr(s, 1, 3);
+	if (inject_off())
+		check(r == NULL, "substr must return NULL when malloc fails");
+	free(r);
+	free(s);
 }
 #endif
 
-#ifdef HAVE_substr
-static void	t_substr(void)
+/* ------------------------------ strjoin -------------------------------- */
+
+#ifdef T_strjoin
+static void	run_test(void)
 {
-	const char		*s[] = {"hello world", "hello world", "hello world",
-		"hello world", "hello world", "hello world", "", "hello", "hello",
-		"hello"};
-	unsigned int	st[] = {0, 6, 6, 11, 50, 0, 0, 2, 4, 0};
-	size_t			len[] = {5, 5, 100, 5, 5, 0, 5, 2, 10, 5};
-	const char		*exp[] = {"hello", "world", "world", "", "", "", "", "ll",
-		"o", "hello"};
-	char			label[64];
+	static const char	*tab[] = {"", "a", "hello", "world !", "\xff\x80"};
+	char				*x;
+	char				*y;
+	char				*r;
+	char				*e;
+	char				*big;
+	int					i;
+	int					j;
+
+	for (i = 0; i < COUNT(tab); i++)
+		for (j = 0; j < COUNT(tab); j++)
+		{
+			x = xdup(tab[i]);
+			y = xdup(tab[j]);
+			r = ft_strjoin(x, y);
+			e = xalloc(strlen(x) + strlen(y) + 1);
+			strcpy(e, x);
+			strcat(e, y);
+			check(r != NULL && strcmp(r, e) == 0,
+				"strjoin(\"%s\", \"%s\") = %s, expected \"%s\"", S(x), S(y),
+				r ? show(r, strlen(r)) : "NULL", show(e, strlen(e)));
+			check(r != x && r != y, "strjoin returned one of its arguments");
+			check(strcmp(x, tab[i]) == 0 && strcmp(y, tab[j]) == 0,
+				"strjoin modified an argument");
+			free(e);
+			free(r);
+			free(x);
+			free(y);
+		}
+	big = xalloc(50001);
+	memset(big, 'b', 50000);
+	big[50000] = '\0';
+	r = ft_strjoin(big, big);
+	check(r && strlen(r) == 100000 && r[99999] == 'b', "strjoin of 2 x 50000");
+	free(r);
+	free(big);
+	x = xdup("left");
+	y = xdup("right");
+	for (i = 1; i < 5; i++)
+	{
+		inject_on(i);
+		r = ft_strjoin(x, y);
+		if (inject_off())
+			check(r == NULL, "strjoin must return NULL when malloc fails");
+		free(r);
+	}
+	free(x);
+	free(y);
+}
+#endif
+
+/* ------------------------------ strtrim -------------------------------- */
+
+#ifdef T_strtrim
+static char	*ref_trim(const char *s, const char *set)
+{
+	size_t	a;
+	size_t	b;
+	char	*r;
+
+	a = 0;
+	while (s[a] && strchr(set, s[a]) && s[a])
+		a++;
+	b = strlen(s);
+	while (b > a && strchr(set, s[b - 1]))
+		b--;
+	r = xalloc(b - a + 1);
+	memcpy(r, s + a, b - a);
+	r[b - a] = '\0';
+	return (r);
+}
+
+static void	run_test(void)
+{
+	static const char	*sets[] = {"", " ", "a", "ab", "ba ", "abab", "xyz"};
+	static const char	*hand[][3] = {{"  abc  ", " ", "abc"},
+	{"\t\n  hello \n\t", " \n\t", "hello"}, {"abcba", "ab", "c"},
+	{"xxhixx", "x", "hi"}, {"hello", "xyz", "hello"}, {"xxxx", "x", ""},
+	{"", "x", ""}, {"a", "a", ""}, {"hello", "", "hello"},
+	{"   a   b   ", " ", "a   b"}, {"1234abc4321", "4321", "abc"}};
+	static const char	alpha[] = "ab ";
+	char				*s;
+	char				*t;
+	char				*r;
+	char				*e;
+	int					i;
+	int					len;
+	int					n;
+	int					m;
+	int					cnt;
+
+	for (i = 0; i < COUNT(hand); i++)
+	{
+		s = xdup(hand[i][0]);
+		t = xdup(hand[i][1]);
+		r = ft_strtrim(s, t);
+		check(r != NULL && strcmp(r, hand[i][2]) == 0,
+			"strtrim(\"%s\", \"%s\") = %s, expected \"%s\"", S(s), S(t),
+			r ? show(r, strlen(r)) : "NULL", hand[i][2]);
+		free(r);
+		free(s);
+		free(t);
+	}
+	for (len = 0; len <= 5; len++)
+	{
+		cnt = 1;
+		for (i = 0; i < len; i++)
+			cnt *= 3;
+		for (n = 0; n < cnt; n++)
+		{
+			s = xalloc(len + 1);
+			for (i = 0, m = n; i < len; i++, m /= 3)
+				s[i] = alpha[m % 3];
+			s[len] = '\0';
+			for (i = 0; i < COUNT(sets); i++)
+			{
+				t = xdup(sets[i]);
+				r = ft_strtrim(s, t);
+				e = ref_trim(s, t);
+				check(r != NULL && strcmp(r, e) == 0,
+					"strtrim(\"%s\", \"%s\") = %s, expected \"%s\"", S(s), S(t),
+					r ? show(r, strlen(r)) : "NULL", e);
+				free(r);
+				free(e);
+				free(t);
+			}
+			free(s);
+		}
+	}
+	s = xdup("  fail me  ");
+	t = xdup(" ");
+	for (i = 1; i < 4; i++)
+	{
+		inject_on(i);
+		r = ft_strtrim(s, t);
+		if (inject_off())
+			check(r == NULL, "strtrim must return NULL when malloc fails");
+		free(r);
+	}
+	free(s);
+	free(t);
+}
+#endif
+
+/* ------------------------------ split ---------------------------------- */
+
+#ifdef T_split
+typedef struct s_scase
+{
+	const char	*s;
+	char		c;
+	const char	*exp[16];
+}	t_scase;
+
+static void	free_split(char **r, int max)
+{
+	int	i;
+
+	for (i = 0; i < max && r[i]; i++)
+		free(r[i]);
+	free(r);
+}
+
+static void	run_test(void)
+{
+	static const t_scase	cases[] = {
+	{"hello world", ' ', {"hello", "world"}},
+	{"  hello   world  ", ' ', {"hello", "world"}},
+	{"abc", ' ', {"abc"}}, {"", ' ', {NULL}}, {"     ", ' ', {NULL}},
+	{"a", 'a', {NULL}}, {"aaa", 'a', {NULL}}, {"a", ' ', {"a"}},
+	{"a b c d e", ' ', {"a", "b", "c", "d", "e"}},
+	{"  a", ' ', {"a"}}, {"a  ", ' ', {"a"}}, {" a ", ' ', {"a"}},
+	{"a,b,,c,", ',', {"a", "b", "c"}}, {",,,", ',', {NULL}},
+	{"abc", '\0', {"abc"}}, {"", '\0', {NULL}},
+	{"tab\tsep\tok", '\t', {"tab", "sep", "ok"}},
+	{"line1\nline2\n\nline3", '\n', {"line1", "line2", "line3"}},
+	{"xAxxBxxxCxxxxD", 'x', {"A", "B", "C", "D"}},
+	{"a\xff" "b", '\xff', {"a", "b"}},
+	{"lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed non risus.",
+		' ', {"lorem", "ipsum", "dolor", "sit", "amet,", "consectetur",
+			"adipiscing", "elit.", "Sed", "non", "risus."}}};
+	char					**r;
+	char					*in;
+	char					*big;
+	int						k;
+	int						i;
+	int						ne;
+
+	for (k = 0; k < COUNT(cases); k++)
+	{
+		in = xdup(cases[k].s);
+		r = ft_split(in, cases[k].c);
+		ne = 0;
+		while (cases[k].exp[ne])
+			ne++;
+		check(r != NULL, "split(\"%s\", '%c') returned NULL", S(in),
+			cases[k].c >= 32 ? cases[k].c : '?');
+		if (r)
+		{
+			for (i = 0; i < ne; i++)
+			{
+				if (r[i] == NULL)
+				{
+					check(0, "split(\"%s\", '%c'): only %d words, expected %d",
+						S(in), cases[k].c >= 32 ? cases[k].c : '?', i, ne);
+					break ;
+				}
+				check(strcmp(r[i], cases[k].exp[i]) == 0,
+					"split(\"%s\", '%c')[%d] = \"%s\", expected \"%s\"", S(in),
+					cases[k].c >= 32 ? cases[k].c : '?', i,
+					show(r[i], strlen(r[i])), cases[k].exp[i]);
+			}
+			if (i == ne)
+				check(r[ne] == NULL,
+					"split(\"%s\", '%c'): array not NULL-terminated after %d words",
+					S(in), cases[k].c >= 32 ? cases[k].c : '?', ne);
+			free_split(r, i == ne ? ne : i);
+		}
+		free(in);
+	}
+	big = xalloc(2001);
+	for (i = 0; i < 1000; i++)
+	{
+		big[2 * i] = 'w';
+		big[2 * i + 1] = ' ';
+	}
+	big[2000] = '\0';
+	r = ft_split(big, ' ');
+	for (i = 0; r && i < 1000 && r[i]; i++)
+		;
+	check(r && i == 1000 && r[1000] == NULL, "split of 1000 one-letter words");
+	if (r)
+		free_split(r, i);
+	free(big);
+	in = xdup("ab cd ef gh");
+	for (k = 1; k < 12; k++)
+	{
+		inject_on(k);
+		r = ft_split(in, ' ');
+		if (inject_off())
+			check(r == NULL,
+				"split must return NULL when malloc #%d fails (and free what it already allocated)",
+				k);
+		else
+			free_split(r, 4);
+	}
+	free(in);
+}
+#endif
+
+/* ------------------------------ itoa ----------------------------------- */
+
+#ifdef T_itoa
+static void	itoa_one(int n)
+{
+	char	exp[32];
+	char	*r;
+
+	snprintf(exp, sizeof(exp), "%d", n);
+	r = ft_itoa(n);
+	check(r != NULL && strcmp(r, exp) == 0, "itoa(%d) = %s, expected \"%s\"",
+		n, r ? show(r, strlen(r)) : "NULL", exp);
+	free(r);
+}
+
+static void	run_test(void)
+{
+	unsigned int	seed;
+	long			p;
+	int				n;
 	int				i;
+	char			*r;
 
-	i = 0;
-	while (i < 10)
+	for (n = -1100; n <= 1100; n++)
+		itoa_one(n);
+	itoa_one(INT_MIN);
+	itoa_one(INT_MIN + 1);
+	itoa_one(INT_MAX);
+	itoa_one(INT_MAX - 1);
+	for (p = 1; p <= 1000000000; p *= 10)
 	{
-		snprintf(label, 64, "(\"%s\", %u, %zu)", s[i], st[i], len[i]);
-		expect_str(ft_substr(s[i], st[i], len[i]), exp[i], label);
-		i++;
+		itoa_one((int)p);
+		itoa_one((int)p - 1);
+		itoa_one((int)p + 1);
+		itoa_one(-(int)p);
+		itoa_one(-(int)p - 1);
+		itoa_one(-(int)p + 1);
+	}
+	seed = 12345;
+	for (i = 0; i < 20000; i++)
+	{
+		seed = seed * 1103515245u + 12345u;
+		itoa_one((int)seed);
+	}
+	for (i = 1; i < 4; i++)
+	{
+		inject_on(i);
+		r = ft_itoa(-42);
+		if (inject_off())
+			check(r == NULL, "itoa must return NULL when malloc fails");
+		free(r);
 	}
 }
-# define T_substr run("ft_substr", t_substr)
-#else
-# define T_substr skip("ft_substr")
 #endif
 
-#ifdef HAVE_strjoin
-static void	t_strjoin(void)
+/* ------------------------------ strmapi / striteri --------------------- */
+
+#if defined(T_strmapi) || defined(T_striteri)
+static unsigned int	g_calls;
+static unsigned int	g_order_ok;
+
+static void	order_reset(void)
 {
-	expect_str(ft_strjoin("hello", " world"), "hello world", "(hello, world)");
-	expect_str(ft_strjoin("", "abc"), "abc", "(\"\", abc)");
-	expect_str(ft_strjoin("abc", ""), "abc", "(abc, \"\")");
-	expect_str(ft_strjoin("", ""), "", "(\"\", \"\")");
-	expect_str(ft_strjoin("a", "b"), "ab", "(a, b)");
+	g_calls = 0;
+	g_order_ok = 1;
 }
-# define T_strjoin run("ft_strjoin", t_strjoin)
-#else
-# define T_strjoin skip("ft_strjoin")
+
+static void	order_note(unsigned int i)
+{
+	if (i != g_calls)
+		g_order_ok = 0;
+	g_calls++;
+}
 #endif
 
-#ifdef HAVE_strtrim
-static void	t_strtrim(void)
+#ifdef T_strmapi
+static char	f_add(unsigned int i, char c)
 {
-	const char	*s[] = {"  hello  ", "xxhelloxx", "hello", "", "", "aaaa",
-		"abcHELLOcba", "a b a", "hello", " \t\nhi\n\t ", "x"};
-	const char	*set[] = {" ", "x", "", "", "abc", "a", "abc", "a", "xyz",
-		" \t\n", "x"};
-	const char	*exp[] = {"hello", "hello", "hello", "", "", "", "HELLO",
-		" b ", "hello", "hi", ""};
-	char		label[64];
-	int			i;
-
-	i = 0;
-	while (i < 11)
-	{
-		snprintf(label, 64, "case %d (\"%s\", set)", i, s[i]);
-		expect_str(ft_strtrim(s[i], set[i]), exp[i], label);
-		i++;
-	}
+	order_note(i);
+	return ((char)(c + i));
 }
-# define T_strtrim run("ft_strtrim", t_strtrim)
-#else
-# define T_strtrim skip("ft_strtrim")
+
+static char	f_upper(unsigned int i, char c)
+{
+	order_note(i);
+	return ((char)toupper((unsigned char)c));
+}
+
+static char	f_zero_at_1(unsigned int i, char c)
+{
+	order_note(i);
+	return (i == 1 ? '\0' : c);
+}
+
+static void	run_test(void)
+{
+	char	*s;
+	char	*r;
+	char	*big;
+	size_t	i;
+
+	s = xdup("abc");
+	order_reset();
+	r = ft_strmapi(s, f_add);
+	check(r != NULL && strcmp(r, "ace") == 0, "strmapi(\"abc\", c+i) = %s",
+		r ? show(r, strlen(r)) : "NULL");
+	check(g_calls == 3 && g_order_ok, "f must be called 3 times with i=0,1,2 in order (called %u)",
+		g_calls);
+	check(strcmp(s, "abc") == 0, "strmapi modified the source string");
+	free(r);
+	free(s);
+	s = xdup("");
+	order_reset();
+	r = ft_strmapi(s, f_add);
+	check(r != NULL && *r == '\0' && g_calls == 0,
+		"strmapi on \"\" must return \"\" without calling f");
+	free(r);
+	free(s);
+	s = xdup("Hello, World 42\xff");
+	order_reset();
+	r = ft_strmapi(s, f_upper);
+	check(r != NULL && strcmp(r, "HELLO, WORLD 42\xff") == 0,
+		"strmapi(toupper) = %s", r ? show(r, strlen(r)) : "NULL");
+	free(r);
+	free(s);
+	s = xdup("abcd");
+	order_reset();
+	r = ft_strmapi(s, f_zero_at_1);
+	check(r != NULL && memcmp(r, "a\0cd\0", 5) == 0 && g_calls == 4,
+		"strmapi must call f for every index even if f returns '\\0' (calls=%u)",
+		g_calls);
+	free(r);
+	free(s);
+	big = xalloc(5001);
+	memset(big, 'a', 5000);
+	big[5000] = '\0';
+	order_reset();
+	r = ft_strmapi(big, f_add);
+	for (i = 0; r && i < 5000; i++)
+		if (r[i] != (char)('a' + (unsigned int)i))
+			break ;
+	check(r && i == 5000 && r[5000] == '\0' && g_calls == 5000 && g_order_ok,
+		"strmapi on 5000 chars (failed at index %zu)", i);
+	free(r);
+	free(big);
+	s = xdup("fail me");
+	inject_on(1);
+	r = ft_strmapi(s, f_upper);
+	if (inject_off())
+		check(r == NULL, "strmapi must return NULL when malloc fails");
+	free(r);
+	free(s);
+}
 #endif
 
-#ifdef HAVE_split
-static void	split_case(const char *s, char c, const char **exp, int n)
+#ifdef T_striteri
+static char	*g_base;
+static int	g_ptr_ok;
+
+static void	f_add(unsigned int i, char *c)
 {
-	char	**tab;
-	int		i;
-
-	tab = ft_split(s, c);
-	check(tab != NULL, "(\"%s\", %d) returned NULL", s, c);
-	if (!tab)
-		return ;
-	i = 0;
-	while (i < n && tab[i])
-	{
-		check(strcmp(tab[i], exp[i]) == 0,
-			"(\"%s\", %d) word %d got \"%s\" expected \"%s\"", s, c, i, tab[i],
-			exp[i]);
-		i++;
-	}
-	check(i == n, "(\"%s\", %d) only %d words, expected %d", s, c, i, n);
-	if (i == n)
-		check(tab[n] == NULL, "(\"%s\", %d) array not NULL-terminated after %d words",
-			s, c, n);
-	i = 0;
-	while (tab[i])
-		free(tab[i++]);
-	free(tab);
-}
-
-static void	t_split(void)
-{
-	const char	*hw[] = {"hello", "world"};
-	const char	*one[] = {"hello"};
-	const char	*abc[] = {"a", "b", "c"};
-	const char	*a[] = {"a"};
-
-	split_case("hello world", ' ', hw, 2);
-	split_case("  hello   world  ", ' ', hw, 2);
-	split_case("", ' ', NULL, 0);
-	split_case("     ", ' ', NULL, 0);
-	split_case("hello", ' ', one, 1);
-	split_case("a,b,,c", ',', abc, 3);
-	split_case("hello", '\0', one, 1);
-	split_case(",a", ',', a, 1);
-	split_case("a,", ',', a, 1);
-	split_case("", '\0', NULL, 0);
-}
-# define T_split run("ft_split", t_split)
-#else
-# define T_split skip("ft_split")
-#endif
-
-#ifdef HAVE_itoa
-static void	t_itoa(void)
-{
-	int		vals[] = {0, 42, -42, INT_MAX, INT_MIN, 7, -1, 1000, 10, -10, 99,
-		100, -2147483647};
-	char	exp[16];
-	char	label[32];
-	int		i;
-
-	i = 0;
-	while (i < 13)
-	{
-		snprintf(exp, 16, "%d", vals[i]);
-		snprintf(label, 32, "(%d)", vals[i]);
-		expect_str(ft_itoa(vals[i]), exp, label);
-		i++;
-	}
-}
-# define T_itoa run("ft_itoa", t_itoa)
-#else
-# define T_itoa skip("ft_itoa")
-#endif
-
-#ifdef HAVE_strmapi
-static char	map_fn(unsigned int i, char c)
-{
-	if (i % 2 == 0)
-		return ((char)toupper((unsigned char)c));
-	return (c);
-}
-
-static void	t_strmapi(void)
-{
-	expect_str(ft_strmapi("hello", map_fn), "HeLlO", "(hello, f)");
-	expect_str(ft_strmapi("", map_fn), "", "(\"\", f)");
-	expect_str(ft_strmapi("a", map_fn), "A", "(a, f)");
-	expect_str(ft_strmapi("abcdefgh", map_fn), "AbCdEfGh", "(abcdefgh, f)");
-}
-# define T_strmapi run("ft_strmapi", t_strmapi)
-#else
-# define T_strmapi skip("ft_strmapi")
-#endif
-
-#ifdef HAVE_striteri
-static void	iter_fn(unsigned int i, char *c)
-{
+	order_note(i);
+	if (c != g_base + i)
+		g_ptr_ok = 0;
 	*c = (char)(*c + i);
 }
 
-static void	t_striteri(void)
+static void	f_upper(unsigned int i, char *c)
 {
-	char	a[] = "aaaa";
-	char	b[] = "";
-	char	c[] = "0000000000";
-
-	ft_striteri(a, iter_fn);
-	check(strcmp(a, "abcd") == 0, "\"aaaa\" got \"%s\" expected \"abcd\"", a);
-	ft_striteri(b, iter_fn);
-	check(b[0] == '\0', "empty string was modified");
-	ft_striteri(c, iter_fn);
-	check(strcmp(c, "0123456789") == 0, "got \"%s\" expected \"0123456789\"", c);
+	order_note(i);
+	*c = (char)toupper((unsigned char)*c);
 }
-# define T_striteri run("ft_striteri", t_striteri)
-#else
-# define T_striteri skip("ft_striteri")
+
+static void	run_test(void)
+{
+	char	*s;
+	char	*big;
+	size_t	i;
+
+	s = xdup("abc");
+	g_base = s;
+	g_ptr_ok = 1;
+	order_reset();
+	ft_striteri(s, f_add);
+	check(strcmp(s, "ace") == 0, "striteri(\"abc\", c+i) = \"%s\"",
+		show(s, strlen(s)));
+	check(g_calls == 3 && g_order_ok, "f must be called 3 times with i=0,1,2 in order (called %u)",
+		g_calls);
+	check(g_ptr_ok, "f must receive the ADDRESS of s[i], not a copy");
+	free(s);
+	s = xdup("");
+	order_reset();
+	ft_striteri(s, f_upper);
+	check(g_calls == 0, "striteri on \"\" must not call f (called %u)", g_calls);
+	free(s);
+	s = xdup("Hello, World 42");
+	ft_striteri(s, f_upper);
+	check(strcmp(s, "HELLO, WORLD 42") == 0, "striteri(toupper) = \"%s\"",
+		show(s, strlen(s)));
+	free(s);
+	big = xalloc(5001);
+	memset(big, 'a', 5000);
+	big[5000] = '\0';
+	g_base = big;
+	g_ptr_ok = 1;
+	order_reset();
+	ft_striteri(big, f_add);
+	for (i = 0; i < 5000; i++)
+		if (big[i] != (char)('a' + (unsigned int)i))
+			break ;
+	check(i == 5000 && g_calls == 5000 && g_order_ok && g_ptr_ok,
+		"striteri on 5000 chars (failed at index %zu)", i);
+	free(big);
+}
 #endif
 
-#if defined(HAVE_putchar_fd) || defined(HAVE_putstr_fd) \
-	|| defined(HAVE_putendl_fd) || defined(HAVE_putnbr_fd)
-static int	fd_open(void)
+/* ------------------------------ put*_fd -------------------------------- */
+
+#if defined(T_putchar_fd) || defined(T_putstr_fd) || defined(T_putendl_fd) \
+	|| defined(T_putnbr_fd)
+static char	g_cap_path[64];
+
+static int	cap_start(void)
 {
-	return (open(FD_TMP, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600));
+	int	fd;
+
+	strcpy(g_cap_path, "/tmp/libft_tester_XXXXXX");
+	fd = mkstemp(g_cap_path);
+	return (fd);
 }
 
-static void	fd_expect(int fd, const char *exp, const char *label)
+/* Reads back what was written, closes and removes the file. */
+static size_t	cap_end(int fd, char *buf, size_t max)
 {
-	char	buf[128];
-	long	r;
+	ssize_t	r;
 
 	lseek(fd, 0, SEEK_SET);
-	r = (long)read(fd, buf, 127);
-	if (r < 0)
-		r = 0;
-	buf[r] = '\0';
-	check(r == (long)strlen(exp) && memcmp(buf, exp, (size_t)r) == 0,
-		"%s wrote \"%s\" (%ld bytes) expected \"%s\"", label, buf, r, exp);
+	r = read(fd, buf, max);
 	close(fd);
-	unlink(FD_TMP);
+	unlink(g_cap_path);
+	return (r < 0 ? 0 : (size_t)r);
 }
 #endif
 
-#ifdef HAVE_putchar_fd
-static void	t_putchar_fd(void)
+#ifdef T_putchar_fd
+static void	run_test(void)
 {
-	int	fd;
+	static char	buf[512];
+	size_t		got;
+	int			fd;
+	int			c;
 
-	fd = fd_open();
-	ft_putchar_fd('A', fd);
-	fd_expect(fd, "A", "('A')");
-	fd = fd_open();
+	fd = cap_start();
+	ft_putchar_fd('a', fd);
+	got = cap_end(fd, buf, sizeof(buf));
+	check(got == 1 && buf[0] == 'a', "putchar_fd('a'): wrote %zu bytes", got);
+	fd = cap_start();
 	ft_putchar_fd('\n', fd);
-	fd_expect(fd, "\n", "('\\n')");
-	fd = fd_open();
-	ft_putchar_fd('4', fd);
-	ft_putchar_fd('2', fd);
-	fd_expect(fd, "42", "('4') then ('2')");
+	got = cap_end(fd, buf, sizeof(buf));
+	check(got == 1 && buf[0] == '\n', "putchar_fd('\\n'): wrote %zu bytes", got);
+	fd = cap_start();
+	ft_putchar_fd('\0', fd);
+	got = cap_end(fd, buf, sizeof(buf));
+	check(got == 1 && buf[0] == '\0', "putchar_fd('\\0') must write 1 byte (wrote %zu)",
+		got);
+	fd = cap_start();
+	for (c = 0; c < 256; c++)
+		ft_putchar_fd((char)c, fd);
+	got = cap_end(fd, buf, sizeof(buf));
+	for (c = 0; c < 256 && got == 256; c++)
+		if ((unsigned char)buf[c] != c)
+			break ;
+	check(got == 256 && c == 256, "putchar_fd of all 256 byte values (got %zu bytes, first bad %d)",
+		got, c);
+	ft_putchar_fd('x', -1);
+	check(1, "survives an invalid fd");
 }
-# define T_putchar_fd run("ft_putchar_fd", t_putchar_fd)
-#else
-# define T_putchar_fd skip("ft_putchar_fd")
 #endif
 
-#ifdef HAVE_putstr_fd
-static void	t_putstr_fd(void)
+#ifdef T_putstr_fd
+static void	run_test(void)
 {
-	int	fd;
+	static const char	*tab[] = {"", "a", "hello", "hello\n", "tab\there",
+		"\xff\x80 high", "ab\0cd"};
+	static char			buf[200100];
+	char				*big;
+	size_t				got;
+	int					fd;
+	int					i;
 
-	fd = fd_open();
-	ft_putstr_fd("hello", fd);
-	fd_expect(fd, "hello", "(\"hello\")");
-	fd = fd_open();
-	ft_putstr_fd("", fd);
-	fd_expect(fd, "", "(\"\")");
-	fd = fd_open();
-	ft_putstr_fd("a\nb", fd);
-	fd_expect(fd, "a\nb", "(\"a\\nb\")");
-}
-# define T_putstr_fd run("ft_putstr_fd", t_putstr_fd)
-#else
-# define T_putstr_fd skip("ft_putstr_fd")
-#endif
-
-#ifdef HAVE_putendl_fd
-static void	t_putendl_fd(void)
-{
-	int	fd;
-
-	fd = fd_open();
-	ft_putendl_fd("hello", fd);
-	fd_expect(fd, "hello\n", "(\"hello\")");
-	fd = fd_open();
-	ft_putendl_fd("", fd);
-	fd_expect(fd, "\n", "(\"\")");
-}
-# define T_putendl_fd run("ft_putendl_fd", t_putendl_fd)
-#else
-# define T_putendl_fd skip("ft_putendl_fd")
-#endif
-
-#ifdef HAVE_putnbr_fd
-static void	t_putnbr_fd(void)
-{
-	int		vals[] = {0, 42, -42, INT_MAX, INT_MIN, 7, -7, 100000, 10, -10};
-	char	exp[16];
-	char	label[32];
-	int		fd;
-	int		i;
-
-	i = 0;
-	while (i < 10)
+	for (i = 0; i < COUNT(tab); i++)
 	{
-		snprintf(exp, 16, "%d", vals[i]);
-		snprintf(label, 32, "(%d)", vals[i]);
-		fd = fd_open();
-		ft_putnbr_fd(vals[i], fd);
-		fd_expect(fd, exp, label);
-		i++;
+		fd = cap_start();
+		ft_putstr_fd((char *)tab[i], fd);
+		got = cap_end(fd, buf, sizeof(buf));
+		check(got == strlen(tab[i]) && memcmp(buf, tab[i], got) == 0,
+			"putstr_fd(\"%s\"): wrote %zu bytes, expected %zu", show(tab[i],
+				strlen(tab[i])), got, strlen(tab[i]));
 	}
+	big = xalloc(150001);
+	memset(big, 'k', 150000);
+	big[150000] = '\0';
+	fd = cap_start();
+	ft_putstr_fd(big, fd);
+	got = cap_end(fd, buf, sizeof(buf));
+	check(got == 150000 && memcmp(buf, big, got) == 0,
+		"putstr_fd of 150000 chars wrote %zu bytes", got);
+	free(big);
+	ft_putstr_fd("x", -1);
 }
-# define T_putnbr_fd run("ft_putnbr_fd", t_putnbr_fd)
-#else
-# define T_putnbr_fd skip("ft_putnbr_fd")
 #endif
 
-/* --------------------------- Part 3 : lists ---------------------------- */
-
-#if defined(HAVE_lstdelone) || defined(HAVE_lstclear) || defined(HAVE_lstmap)
-static int	g_del = 0;
-
-UNUSED static void	del_count(void *content)
+#ifdef T_putendl_fd
+static void	run_test(void)
 {
-	g_del++;
-	free(content);
+	static const char	*tab[] = {"", "a", "hello", "hello\n", "\xff\x80 high"};
+	static char			buf[256];
+	char				exp[64];
+	size_t				got;
+	int					fd;
+	int					i;
+
+	for (i = 0; i < COUNT(tab); i++)
+	{
+		fd = cap_start();
+		ft_putendl_fd((char *)tab[i], fd);
+		got = cap_end(fd, buf, sizeof(buf));
+		snprintf(exp, sizeof(exp), "%s\n", tab[i]);
+		check(got == strlen(exp) && memcmp(buf, exp, got) == 0,
+			"putendl_fd(\"%s\"): got \"%s\" (%zu bytes), expected \"%s\"",
+			show(tab[i], strlen(tab[i])), show(buf, got), got,
+			show(exp, strlen(exp)));
+	}
+	ft_putendl_fd("x", -1);
+}
+#endif
+
+#ifdef T_putnbr_fd
+static void	putnbr_one(int n)
+{
+	static char	buf[64];
+	char		exp[32];
+	size_t		got;
+	int			fd;
+
+	fd = cap_start();
+	ft_putnbr_fd(n, fd);
+	got = cap_end(fd, buf, sizeof(buf));
+	snprintf(exp, sizeof(exp), "%d", n);
+	check(got == strlen(exp) && memcmp(buf, exp, got) == 0,
+		"putnbr_fd(%d): got \"%s\", expected \"%s\"", n, show(buf, got), exp);
 }
 
-UNUSED static t_list	*heap_node(int value)
+static void	run_test(void)
+{
+	unsigned int	seed;
+	int				n;
+	int				i;
+
+	for (n = -1100; n <= 1100; n++)
+		putnbr_one(n);
+	putnbr_one(INT_MIN);
+	putnbr_one(INT_MIN + 1);
+	putnbr_one(INT_MAX);
+	putnbr_one(INT_MAX - 1);
+	putnbr_one(1000000000);
+	putnbr_one(-1000000000);
+	seed = 777;
+	for (i = 0; i < 2000; i++)
+	{
+		seed = seed * 1103515245u + 12345u;
+		putnbr_one((int)seed);
+	}
+	ft_putnbr_fd(42, -1);
+}
+#endif
+
+/* ------------------------------ linked list ---------------------------- */
+
+#if defined(T_lstnew) || defined(T_lstadd_front) || defined(T_lstsize) \
+	|| defined(T_lstlast) || defined(T_lstadd_back) || defined(T_lstdelone) \
+	|| defined(T_lstclear) || defined(T_lstiter) || defined(T_lstmap)
+static int	g_del_count;
+static int	g_del_order[64];
+static int	g_live;
+
+static int	*mkint(int v)
+{
+	int	*p;
+
+	p = __real_malloc(sizeof(int));
+	*p = v;
+	g_live++;
+	return (p);
+}
+
+static void	del_int(void *p)
+{
+	if (g_del_count < 64)
+		g_del_order[g_del_count] = *(int *)p;
+	g_del_count++;
+	g_live--;
+	free(p);
+}
+
+static void	del_noop(void *p)
+{
+	(void)p;
+	g_del_count++;
+}
+
+static t_list	*mknode(void *content)
 {
 	t_list	*n;
-	int		*v;
 
-	n = malloc(sizeof(t_list));
-	v = malloc(sizeof(int));
-	if (!n || !v)
-		exit(2);
-	*v = value;
-	n->content = v;
+	n = __real_malloc(sizeof(t_list));
+	n->content = content;
 	n->next = NULL;
 	return (n);
 }
+
+/* list holding ints 1..n built by hand (independent of the code under test) */
+static t_list	*mklist(int n)
+{
+	t_list	*head;
+	t_list	*cur;
+	int		i;
+
+	head = NULL;
+	cur = NULL;
+	for (i = 1; i <= n; i++)
+	{
+		if (!head)
+			head = cur = mknode(mkint(i));
+		else
+		{
+			cur->next = mknode(mkint(i));
+			cur = cur->next;
+		}
+	}
+	return (head);
+}
+
+static void	freelist(t_list *l, int free_content)
+{
+	t_list	*nx;
+
+	while (l)
+	{
+		nx = l->next;
+		if (free_content)
+		{
+			free(l->content);
+			g_live--;
+		}
+		free(l);
+		l = nx;
+	}
+}
+
+static int	list_is(t_list *l, int n, int mul)
+{
+	int	i;
+
+	for (i = 1; i <= n; i++)
+	{
+		if (l == NULL || l->content == NULL || *(int *)l->content != i * mul)
+			return (0);
+		l = l->next;
+	}
+	return (l == NULL);
+}
 #endif
 
-#ifdef HAVE_lstnew
-static void	t_lstnew(void)
+#ifdef T_lstnew
+static void	run_test(void)
 {
-	t_list	*n;
 	int		x;
+	t_list	*n;
+	int		i;
 
 	x = 42;
 	n = ft_lstnew(&x);
-	check(n != NULL, "returned NULL");
+	check(n != NULL, "lstnew returned NULL");
 	if (n)
 	{
-		check(n->content == &x, "content is not the given pointer");
-		check(n->next == NULL, "next is not NULL");
+		check(n->content == &x, "lstnew: content must be the pointer given (no copy)");
+		check(n->next == NULL, "lstnew: next must be NULL");
 		free(n);
 	}
 	n = ft_lstnew(NULL);
-	check(n != NULL, "lstnew(NULL) returned NULL (a node with NULL content is valid)");
-	if (n)
+	check(n != NULL && n->content == NULL && n->next == NULL,
+		"lstnew(NULL) must give a valid node with content NULL");
+	free(n);
+	for (i = 1; i < 3; i++)
 	{
-		check(n->content == NULL && n->next == NULL, "lstnew(NULL) wrong fields");
+		inject_on(i);
+		n = ft_lstnew(&x);
+		if (inject_off())
+			check(n == NULL, "lstnew must return NULL when malloc fails");
 		free(n);
 	}
 }
-# define T_lstnew run("ft_lstnew", t_lstnew)
-#else
-# define T_lstnew skip("ft_lstnew")
 #endif
 
-#ifdef HAVE_lstadd_front
-static void	t_lstadd_front(void)
+#ifdef T_lstadd_front
+static void	run_test(void)
 {
-	t_list	a;
-	t_list	b;
-	t_list	*lst;
+	t_list	*l;
+	t_list	*a;
+	t_list	*b;
+	t_list	*c;
 
-	a.content = NULL;
-	a.next = NULL;
-	b.content = NULL;
-	b.next = NULL;
-	lst = NULL;
-	ft_lstadd_front(&lst, &a);
-	check(lst == &a && a.next == NULL, "adding to an empty list failed");
-	ft_lstadd_front(&lst, &b);
-	check(lst == &b, "list head is not the new node");
-	check(b.next == &a, "new->next is not the old head");
-	check(a.next == NULL, "old head was modified");
+	l = NULL;
+	a = mknode(NULL);
+	ft_lstadd_front(&l, a);
+	check(l == a && a->next == NULL, "lstadd_front on an empty list (*lst == NULL)");
+	b = mknode(NULL);
+	ft_lstadd_front(&l, b);
+	check(l == b && b->next == a && a->next == NULL,
+		"lstadd_front: new head must point to the old head");
+	c = mknode(NULL);
+	ft_lstadd_front(&l, c);
+	check(l == c && c->next == b && b->next == a && a->next == NULL,
+		"lstadd_front: chain of three");
+	free(a);
+	free(b);
+	free(c);
 }
-# define T_lstadd_front run("ft_lstadd_front", t_lstadd_front)
-#else
-# define T_lstadd_front skip("ft_lstadd_front")
 #endif
 
-#ifdef HAVE_lstsize
-static void	t_lstsize(void)
+#ifdef T_lstsize
+static void	run_test(void)
 {
-	t_list	a;
-	t_list	b;
-	t_list	c;
+	t_list	*l;
+	int		n;
 
-	a.next = &b;
-	b.next = &c;
-	c.next = NULL;
-	check(ft_lstsize(NULL) == 0, "size of NULL list = %d expected 0",
+	check(ft_lstsize(NULL) == 0, "lstsize(NULL) must be 0 (got %d)",
 		ft_lstsize(NULL));
-	check(ft_lstsize(&c) == 1, "size = %d expected 1", ft_lstsize(&c));
-	check(ft_lstsize(&a) == 3, "size = %d expected 3", ft_lstsize(&a));
+	for (n = 1; n <= 50; n++)
+	{
+		l = mklist(n);
+		check(ft_lstsize(l) == n, "lstsize of a %d nodes list = %d", n,
+			ft_lstsize(l));
+		freelist(l, 1);
+	}
+	l = mklist(10000);
+	check(ft_lstsize(l) == 10000, "lstsize of 10000 nodes = %d", ft_lstsize(l));
+	freelist(l, 1);
 }
-# define T_lstsize run("ft_lstsize", t_lstsize)
-#else
-# define T_lstsize skip("ft_lstsize")
 #endif
 
-#ifdef HAVE_lstlast
-static void	t_lstlast(void)
+#ifdef T_lstlast
+static void	run_test(void)
 {
-	t_list	a;
-	t_list	b;
-	t_list	c;
+	t_list	*l;
+	t_list	*t;
+	int		n;
 
-	a.next = &b;
-	b.next = &c;
-	c.next = NULL;
-	check(ft_lstlast(NULL) == NULL, "last of NULL list must be NULL");
-	check(ft_lstlast(&c) == &c, "last of a 1-node list is wrong");
-	check(ft_lstlast(&a) == &c, "last of a 3-node list is wrong");
+	check(ft_lstlast(NULL) == NULL, "lstlast(NULL) must be NULL");
+	for (n = 1; n <= 20; n++)
+	{
+		l = mklist(n);
+		for (t = l; t->next; t = t->next)
+			;
+		check(ft_lstlast(l) == t, "lstlast of %d nodes: wrong node", n);
+		freelist(l, 1);
+	}
 }
-# define T_lstlast run("ft_lstlast", t_lstlast)
-#else
-# define T_lstlast skip("ft_lstlast")
 #endif
 
-#ifdef HAVE_lstadd_back
-static void	t_lstadd_back(void)
+#ifdef T_lstadd_back
+static void	run_test(void)
 {
-	t_list	a;
-	t_list	b;
-	t_list	c;
-	t_list	*lst;
-
-	a.next = NULL;
-	b.next = NULL;
-	c.next = NULL;
-	lst = NULL;
-	ft_lstadd_back(&lst, &a);
-	check(lst == &a, "adding to an empty list must set the head");
-	ft_lstadd_back(&lst, &b);
-	check(lst == &a && a.next == &b, "second node not linked at the end");
-	ft_lstadd_back(&lst, &c);
-	check(lst == &a && b.next == &c && c.next == NULL,
-		"third node not linked at the end");
-}
-# define T_lstadd_back run("ft_lstadd_back", t_lstadd_back)
-#else
-# define T_lstadd_back skip("ft_lstadd_back")
-#endif
-
-#ifdef HAVE_lstdelone
-static void	t_lstdelone(void)
-{
-	t_list	*n1;
-	t_list	*n2;
-
-	n1 = heap_node(1);
-	n2 = heap_node(2);
-	n1->next = n2;
-	g_del = 0;
-	ft_lstdelone(n1, del_count);
-	check(g_del == 1, "del called %d time(s), expected 1", g_del);
-	check(*(int *)n2->content == 2 && n2->next == NULL,
-		"the next node was modified or freed");
-	free(n2->content);
-	free(n2);
-}
-# define T_lstdelone run("ft_lstdelone", t_lstdelone)
-#else
-# define T_lstdelone skip("ft_lstdelone")
-#endif
-
-#ifdef HAVE_lstclear
-static void	t_lstclear(void)
-{
-	t_list	*lst;
-
-	lst = heap_node(1);
-	lst->next = heap_node(2);
-	lst->next->next = heap_node(3);
-	g_del = 0;
-	ft_lstclear(&lst, del_count);
-	check(g_del == 3, "del called %d time(s), expected 3", g_del);
-	check(lst == NULL, "list pointer not set to NULL");
-	lst = NULL;
-	g_del = 0;
-	ft_lstclear(&lst, del_count);
-	check(g_del == 0 && lst == NULL, "clearing an empty list went wrong");
-}
-# define T_lstclear run("ft_lstclear", t_lstclear)
-#else
-# define T_lstclear skip("ft_lstclear")
-#endif
-
-#ifdef HAVE_lstiter
-static void	iter_inc(void *content)
-{
-	*(int *)content += 1;
-}
-
-static void	t_lstiter(void)
-{
-	t_list	a;
-	t_list	b;
-	t_list	c;
-	int		v[3];
-
-	v[0] = 1;
-	v[1] = 10;
-	v[2] = 100;
-	a.content = &v[0];
-	a.next = &b;
-	b.content = &v[1];
-	b.next = &c;
-	c.content = &v[2];
-	c.next = NULL;
-	ft_lstiter(&a, iter_inc);
-	check(v[0] == 2 && v[1] == 11 && v[2] == 101,
-		"values are %d %d %d expected 2 11 101", v[0], v[1], v[2]);
-	ft_lstiter(NULL, iter_inc);
-	check(1, "empty list");
-}
-# define T_lstiter run("ft_lstiter", t_lstiter)
-#else
-# define T_lstiter skip("ft_lstiter")
-#endif
-
-#ifdef HAVE_lstmap
-static void	*map_double(void *content)
-{
-	int	*v;
-
-	v = malloc(sizeof(int));
-	if (!v)
-		exit(2);
-	*v = *(int *)content * 2;
-	return (v);
-}
-
-static void	t_lstmap(void)
-{
-	t_list	a;
-	t_list	b;
-	t_list	c;
-	t_list	*res;
-	t_list	*cur;
-	t_list	*next;
-	int		v[3];
+	t_list	*l;
+	t_list	*n;
 	int		i;
 
-	v[0] = 1;
-	v[1] = 2;
-	v[2] = 3;
-	a.content = &v[0];
-	a.next = &b;
-	b.content = &v[1];
-	b.next = &c;
-	c.content = &v[2];
-	c.next = NULL;
-	g_del = 0;
-	res = ft_lstmap(&a, map_double, del_count);
-	check(res != NULL, "returned NULL");
-	check(res != &a, "returned the original list instead of a new one");
-	cur = res;
-	i = 0;
-	while (cur && i < 3)
-	{
-		check(cur->content != NULL && *(int *)cur->content == v[i] * 2,
-			"node %d has a wrong content", i);
-		cur = cur->next;
-		i++;
-	}
-	check(i == 3 && cur == NULL, "new list has a wrong length");
-	check(v[0] == 1 && v[1] == 2 && v[2] == 3 && a.next == &b && b.next == &c,
-		"the original list was modified");
-	check(g_del == 0, "del was called %d time(s) without any failure", g_del);
-	cur = res;
-	while (cur)
-	{
-		next = cur->next;
-		free(cur->content);
-		free(cur);
-		cur = next;
-	}
-	check(ft_lstmap(NULL, map_double, del_count) == NULL,
-		"lstmap(NULL) must return NULL");
+	l = NULL;
+	n = mknode(mkint(1));
+	ft_lstadd_back(&l, n);
+	check(l == n && n->next == NULL, "lstadd_back on an empty list (*lst == NULL)");
+	for (i = 2; i <= 30; i++)
+		ft_lstadd_back(&l, mknode(mkint(i)));
+	check(list_is(l, 30, 1), "lstadd_back x30: order must be 1..30, NULL-terminated");
+	freelist(l, 1);
 }
-# define T_lstmap run("ft_lstmap", t_lstmap)
-#else
-# define T_lstmap skip("ft_lstmap")
 #endif
 
-/* -------------------------------- main --------------------------------- */
+#ifdef T_lstdelone
+static void	run_test(void)
+{
+	t_list	*l;
+	t_list	*second;
+
+	l = mklist(2);
+	second = l->next;
+	g_del_count = 0;
+	ft_lstdelone(l, del_int);
+	check(g_del_count == 1 && g_del_order[0] == 1,
+		"lstdelone: del must be called exactly once on the content (called %d)",
+		g_del_count);
+	check(second->next == NULL && *(int *)second->content == 2,
+		"lstdelone must not touch the following nodes");
+	freelist(second, 1);
+	l = mknode(NULL);
+	g_del_count = 0;
+	ft_lstdelone(l, del_noop);
+	check(g_del_count == 1, "lstdelone with a NULL content: del called %d times",
+		g_del_count);
+}
+#endif
+
+#ifdef T_lstclear
+static void	run_test(void)
+{
+	t_list	*l;
+	int		i;
+
+	l = mklist(10);
+	g_del_count = 0;
+	ft_lstclear(&l, del_int);
+	check(l == NULL, "lstclear: *lst must be NULL afterwards");
+	check(g_del_count == 10, "lstclear: del called %d times, expected 10",
+		g_del_count);
+	for (i = 0; i < 10 && i < g_del_count; i++)
+		if (g_del_order[i] != i + 1)
+			break ;
+	check(i == 10, "lstclear: del must be called head to tail (bad at %d)", i);
+	l = mklist(1);
+	g_del_count = 0;
+	ft_lstclear(&l, del_int);
+	check(l == NULL && g_del_count == 1, "lstclear on a single node");
+	l = NULL;
+	g_del_count = 0;
+	ft_lstclear(&l, del_int);
+	check(l == NULL && g_del_count == 0, "lstclear on an empty list");
+}
+#endif
+
+#ifdef T_lstiter
+static int	g_iter_n;
+
+static void	f_inc(void *p)
+{
+	g_iter_n++;
+	(*(int *)p)++;
+}
+
+static void	run_test(void)
+{
+	t_list	*l;
+	t_list	*e;
+
+	l = mklist(8);
+	g_iter_n = 0;
+	ft_lstiter(l, f_inc);
+	check(g_iter_n == 8, "lstiter: f called %d times, expected 8", g_iter_n);
+	check(list_is(l, 8, 1) == 0 && *(int *)l->content == 2
+		&& *(int *)l->next->content == 3 && list_is(l, 8, 1) == 0,
+		"lstiter: f must get node->content (every value +1)");
+	freelist(l, 1);
+	e = NULL;
+	g_iter_n = 0;
+	ft_lstiter(e, f_inc);
+	check(g_iter_n == 0, "lstiter on NULL must do nothing");
+}
+#endif
+
+#ifdef T_lstmap
+static void	*f_double(void *p)
+{
+	return (mkint(*(int *)p * 2));
+}
+
+static void	run_test(void)
+{
+	t_list	*l;
+	t_list	*m;
+	t_list	*a;
+	t_list	*b;
+	int		k;
+	int		base;
+
+	l = mklist(7);
+	base = g_live;
+	m = ft_lstmap(l, f_double, del_int);
+	check(list_is(m, 7, 2), "lstmap: new list must hold 2,4,..,14 in order");
+	check(list_is(l, 7, 1), "lstmap must not modify the original list");
+	for (a = l, b = m; a && b; a = a->next, b = b->next)
+		if (a == b || a->content == b->content)
+			break ;
+	check(a == NULL && b == NULL, "lstmap: nodes must be new, not the originals");
+	freelist(m, 1);
+	freelist(l, 1);
+	check(ft_lstmap(NULL, f_double, del_int) == NULL, "lstmap(NULL) must be NULL");
+	l = mklist(5);
+	base = g_live;
+	for (k = 1; k <= 6; k++)
+	{
+		g_del_count = 0;
+		inject_on(k);
+		m = ft_lstmap(l, f_double, del_int);
+		if (inject_off())
+		{
+			check(m == NULL, "lstmap must return NULL when malloc #%d fails", k);
+			check(g_live == base,
+				"lstmap, malloc #%d fails: %d content(s) created by f never passed to del",
+				k, g_live - base);
+			g_live = base;
+		}
+		else
+		{
+			freelist(m, 1);
+			break ;
+		}
+	}
+	freelist(l, 1);
+}
+#endif
+
+/* ------------------------------ main ----------------------------------- */
 
 int	main(void)
 {
-	printf("========== Part 1 : libc ==========\n");
-	T_isalpha;
-	T_isdigit;
-	T_isalnum;
-	T_isascii;
-	T_isprint;
-	T_strlen;
-	T_memset;
-	T_bzero;
-	T_memcpy;
-	T_memmove;
-	T_strlcpy;
-	T_strlcat;
-	T_toupper;
-	T_tolower;
-	T_strchr;
-	T_strrchr;
-	T_strncmp;
-	T_memchr;
-	T_memcmp;
-	T_strnstr;
-	T_atoi;
-	T_calloc;
-	T_strdup;
-	printf("========== Part 2 : additional ==========\n");
-	T_substr;
-	T_strjoin;
-	T_strtrim;
-	T_split;
-	T_itoa;
-	T_strmapi;
-	T_striteri;
-	T_putchar_fd;
-	T_putstr_fd;
-	T_putendl_fd;
-	T_putnbr_fd;
-	printf("========== Part 3 : linked list ==========\n");
-	T_lstnew;
-	T_lstadd_front;
-	T_lstsize;
-	T_lstlast;
-	T_lstadd_back;
-	T_lstdelone;
-	T_lstclear;
-	T_lstiter;
-	T_lstmap;
-	printf("==========================================\n");
-	printf("OK: %d   KO: %d   CRASH: %d   not written yet: %d   (43 functions)\n",
-		g_ok, g_ko, g_crash, g_skip);
-	if (g_ko == 0 && g_crash == 0 && g_skip == 0)
-		printf(GREEN "All 43 functions pass.\n" RESET);
-	else if (g_ko == 0 && g_crash == 0)
-		printf(GREEN "Everything written so far passes.\n" RESET);
-	else
-		printf(RED "Some functions fail: read the lines above.\n" RESET);
-	return (g_ko != 0 || g_crash != 0);
+	setvbuf(stdout, NULL, _IONBF, 0);
+	run_test();
+	printf("@@ %d %d\n", g_checks, g_fails);
+	return (g_fails != 0);
 }

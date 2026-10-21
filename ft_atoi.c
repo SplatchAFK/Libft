@@ -6,7 +6,7 @@
 /*   By: romasant <romasant@student.42.fr>          +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2026/10/12 14:24:26 by romasant          #+#    #+#             */
-/*   Updated: 2026/10/12 14:43:29 by romasant         ###   ########.fr       */
+/*   Updated: 2026/10/21 21:32:42 by romasant         ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
@@ -14,8 +14,8 @@
 
 int	ft_atoi(const char *nptr)
 {
-	int	result;
-	int	sign;
+	long	result;
+	int		sign;
 
 	result = 0;
 	sign = 1;
@@ -32,5 +32,5 @@ int	ft_atoi(const char *nptr)
 		result = (result * 10) + (*nptr - '0');
 		nptr++;
 	}
-	return (result * sign);
+	return ((int)(result * sign));
 }
