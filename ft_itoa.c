@@ -6,7 +6,7 @@
 /*   By: romasant <romasant@student.42.fr>          +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2026/10/23 12:00:47 by romasant          #+#    #+#             */
-/*   Updated: 2026/10/23 13:19:05 by romasant         ###   ########.fr       */
+/*   Updated: 2026/10/25 18:05:24 by romasant         ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
@@ -29,6 +29,7 @@ static void	ft_verif_neg(long n, int *neg, int *len)
 char	*ft_itoa(int n)
 {
 	char	*res;
+
 	int (len) = 1;
 	int (neg) = 0;
 	long (nbr) = n;
