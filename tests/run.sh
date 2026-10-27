@@ -5,7 +5,8 @@
 #   bash tests/run.sh ft_split itoa   only these (with or without "ft_")
 #   bash tests/run.sh -v              full sanitizer reports on failures
 #   bash tests/run.sh -k              keep the build folder (printed at the end)
-#   bash tests/run.sh --no-audit      skip the moulinette audit (Makefile, norm, libc calls)
+#   bash tests/run.sh --audit         force the moulinette audit (Makefile, norm, libc calls)
+# The audit runs by itself only once all 43 functions are written and clean.
 # Every function is built and run alone, with ASan + UBSan + LeakSanitizer,
 # and malloc fault injection (-Wl,--wrap=malloc).
 
@@ -15,14 +16,14 @@ CC="${CC:-cc}"
 VERBOSE=0
 TMO="${LIBFT_TIMEOUT:-30}"
 KEEP=0
-NOAUDIT=0
+FORCEAUDIT=0
 SELECT=()
 for a in "$@"; do
 	case "$a" in
 		-v) VERBOSE=1 ;;
 		-k) KEEP=1 ;;
-		--no-audit) NOAUDIT=1 ;;
-		-h|--help) sed -n "2,10p" "$0"; exit 0 ;;
+		--audit) FORCEAUDIT=1 ;;
+		-h|--help) sed -n "2,11p" "$0"; exit 0 ;;
 		*) a="${a%.c}"; SELECT+=("${a#ft_}") ;;
 	esac
 done
@@ -372,7 +373,17 @@ run_audit() {
 	else audit_line warn "norminette not installed: not checked"; fi
 }
 
-[ ${#SELECT[@]} -eq 0 ] && [ "$NOAUDIT" != 1 ] && run_audit
+# Only when every function is written and clean (or forced with --audit).
+if [ "$FORCEAUDIT" = 1 ]; then
+	run_audit
+elif [ ${#SELECT[@]} -eq 0 ]; then
+	if [ "$n_skip" -eq 0 ] && [ $((n_ko + n_crash + n_leak + n_ub + n_time + n_build)) -eq 0 ]; then
+		run_audit
+	else
+		section "Audit · the moulinette checks"
+		printf '  %sruns once the 43 functions are written and clean (or: --audit)%s\n' "$D" "$R"
+	fi
+fi
 
 # ------------------------------- summary ------------------------------------
 bad=$((n_ko + n_crash + n_leak + n_ub + n_time + n_build + n_audit_ko))
