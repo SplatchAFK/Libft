@@ -721,22 +721,26 @@ static void	run_test(void)
 		{250, 4}, {1000, 1000}, {1, 65536}, {65536, 1}};
 	unsigned char		*p;
 	size_t				i;
+	size_t				a;
+	size_t				b;
 	int					k;
 
-	for (k = 0; k < COUNT(pairs); k++)
+	/* 3 passes: blocks freed full of 0xAB are handed back by malloc, so a
+	** calloc that forgets to clear its memory is caught from pass 2 on. */
+	for (k = 0; k < 3 * COUNT(pairs); k++)
 	{
-		p = ft_calloc(pairs[k][0], pairs[k][1]);
-		check(p != NULL, "calloc(%zu, %zu) returned NULL", pairs[k][0],
-			pairs[k][1]);
+		a = pairs[k % COUNT(pairs)][0];
+		b = pairs[k % COUNT(pairs)][1];
+		p = ft_calloc(a, b);
+		check(p != NULL, "calloc(%zu, %zu) returned NULL", a, b);
 		if (p == NULL)
 			continue ;
-		for (i = 0; i < pairs[k][0] * pairs[k][1]; i++)
+		for (i = 0; i < a * b; i++)
 			if (p[i] != 0)
 				break ;
-		check(i == pairs[k][0] * pairs[k][1],
-			"calloc(%zu, %zu): byte %zu is not zero", pairs[k][0],
-			pairs[k][1], i);
-		memset(p, 0xAB, pairs[k][0] * pairs[k][1]);
+		check(i == a * b, "calloc(%zu, %zu): byte %zu is not zero (dirty memory reused?)",
+			a, b, i);
+		memset(p, 0xAB, a * b);
 		free(p);
 	}
 	expect_null(ft_calloc(SIZE_MAX, 2), "calloc(SIZE_MAX, 2) must be NULL");

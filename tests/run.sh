@@ -5,6 +5,7 @@
 #   bash tests/run.sh ft_split itoa   only these (with or without "ft_")
 #   bash tests/run.sh -v              full sanitizer reports on failures
 #   bash tests/run.sh -k              keep the build folder (printed at the end)
+#   bash tests/run.sh --no-audit      skip the moulinette audit (Makefile, norm, libc calls)
 # Every function is built and run alone, with ASan + UBSan + LeakSanitizer,
 # and malloc fault injection (-Wl,--wrap=malloc).
 
@@ -14,12 +15,14 @@ CC="${CC:-cc}"
 VERBOSE=0
 TMO="${LIBFT_TIMEOUT:-30}"
 KEEP=0
+NOAUDIT=0
 SELECT=()
 for a in "$@"; do
 	case "$a" in
 		-v) VERBOSE=1 ;;
 		-k) KEEP=1 ;;
-		-h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+		--no-audit) NOAUDIT=1 ;;
+		-h|--help) sed -n "2,10p" "$0"; exit 0 ;;
 		*) a="${a%.c}"; SELECT+=("${a#ft_}") ;;
 	esac
 done
@@ -42,11 +45,11 @@ if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
 	TXT=$'\e[38;5;252m'
 	P_OK=$'\e[30;48;5;78m'; P_KO=$'\e[30;48;5;203m'; P_CR=$'\e[97;48;5;125m'
 	P_LK=$'\e[30;48;5;221m'; P_UB=$'\e[30;48;5;215m'; P_TM=$'\e[30;48;5;141m'
-	P_BD=$'\e[30;48;5;117m'; P_SK=$'\e[38;5;245;48;5;236m'
+	P_BD=$'\e[30;48;5;117m'; P_SK=$'\e[38;5;245;48;5;236m'; P_WN=$'\e[30;48;5;221m'
 	F_OK=$'\e[38;5;78m'; F_KO=$'\e[38;5;203m'; F_LK=$'\e[38;5;221m'
 else
 	R=; B=; D=; ACC=; TXT=; P_OK=; P_KO=; P_CR=; P_LK=; P_UB=; P_TM=; P_BD=
-	P_SK=; F_OK=; F_KO=; F_LK=
+	P_WN=; P_SK=; F_OK=; F_KO=; F_LK=
 fi
 
 rule() { # rule <width>
@@ -249,8 +252,130 @@ run_part "Part 1 · libc" "$PART1"
 run_part "Part 2 · additional" "$PART2"
 run_part "Part 3 · linked list" "$PART3"
 
+# ------------------------------- audit --------------------------------------
+# What the moulinette checks besides the logic. Everything is done on a copy
+# (ft_*.c, libft.h, Makefile) in the build folder: the repository is untouched.
+n_audit_ko=0
+n_audit_warn=0
+
+audit_line() { # audit_line <ok|ko|warn> <label> [detail...]
+	local st="$1" label="$2" l
+	shift 2
+	printf '  '
+	case "$st" in
+		ok)   pill "$P_OK" PASS ;;
+		ko)   pill "$P_KO" FAIL; ((n_audit_ko++)) ;;
+		warn) pill "$P_WN" WARN; ((n_audit_warn++)) ;;
+	esac
+	printf '  %s%s%s\n' "$TXT" "$label" "$R"
+	for l in "$@"; do detail "$l"; done
+}
+
+run_audit() {
+	local A="$BUILD/audit" out nsrc nobj bad extra
+	rm -rf "$A"; mkdir -p "$A"
+	cp "$ROOT"/ft_*.c "$ROOT"/libft.h "$ROOT"/Makefile "$A"/ 2>/dev/null
+	section "Audit · the moulinette checks"
+
+	if [ ! -f "$ROOT/Makefile" ]; then
+		audit_line ko "Makefile at the root of the repository"; return
+	fi
+	audit_line ok "Makefile at the root of the repository"
+
+	bad=""
+	for r in all clean fclean re; do
+		grep -qE "^$r[[:space:]]*:" "$ROOT/Makefile" || bad+="$r "
+	done
+	grep -qE '^(\$\(NAME\)|libft\.a)[[:space:]]*:' "$ROOT/Makefile" || bad+='$(NAME) '
+	if [ -z "$bad" ]; then audit_line ok "rules all, \$(NAME), clean, fclean, re"
+	else audit_line ko "rules all, \$(NAME), clean, fclean, re" "missing: $bad"; fi
+
+	if grep -q -- '-Wall' "$ROOT/Makefile" && grep -q -- '-Wextra' "$ROOT/Makefile" \
+		&& grep -q -- '-Werror' "$ROOT/Makefile"; then
+		audit_line ok "flags -Wall -Wextra -Werror in the Makefile"
+	else audit_line ko "flags -Wall -Wextra -Werror in the Makefile"; fi
+
+	if grep -q -- '-std=c99' "$ROOT/Makefile"; then
+		audit_line ko "no -std=c99 (forbidden by the subject)"
+	else audit_line ok "no -std=c99 (forbidden by the subject)"; fi
+
+	if grep -qE 'wildcard|\*\.c|\*\.o' "$ROOT/Makefile"; then
+		audit_line warn "sources named explicitly (Norm v4.1 III.11)" \
+			"wildcard or *.c found: write the list of files before submitting"
+	else audit_line ok "sources named explicitly (Norm v4.1 III.11)"; fi
+
+	out="$(cd "$A" && make 2>&1)"
+	if [ ! -f "$A/libft.a" ]; then
+		audit_line ko "make builds libft.a at the root" \
+			"$(echo "$out" | grep -m2 -E 'error|Error|\*\*\*' | cut -c1-90)"
+		return
+	fi
+	audit_line ok "make builds libft.a at the root"
+
+	out="$(cd "$A" && make 2>&1)"
+	if echo "$out" | grep -qE '(^|[[:space:]])(cc|gcc|clang|ar)[[:space:]]'; then
+		audit_line ko "second make does not relink" \
+			"$(echo "$out" | head -1 | cut -c1-90)"
+	else audit_line ok "second make does not relink"; fi
+
+	nsrc=$(ls "$A"/ft_*.c 2>/dev/null | wc -l)
+	nobj=$(ar t "$A/libft.a" | wc -l)
+	if [ "$nsrc" = "$nobj" ]; then
+		audit_line ok "libft.a holds every ft_*.c ($nobj objects)"
+	else audit_line ko "libft.a holds every ft_*.c" "$nsrc sources, $nobj objects in the archive"; fi
+
+	# undefined symbols that no object of the archive defines = libc calls
+	nm --defined-only "$A/libft.a" 2>/dev/null | awk 'NF==3 {print $3}' | sort -u > "$A/defined.txt"
+	extra="$(nm -u "$A/libft.a" 2>/dev/null | awk 'NF==2 && $1=="U" {print $2}' \
+		| sort -u | comm -23 - "$A/defined.txt" \
+		| grep -vE '^(malloc|free|write|_GLOBAL_OFFSET_TABLE_|__stack_chk_fail)$')"
+	if [ -z "$extra" ]; then
+		audit_line ok "only malloc, free, write are called from libc"
+	else
+		audit_line ko "only malloc, free, write are called from libc" \
+			"forbidden: $(echo $extra | tr '\n' ' ')"
+	fi
+
+	(cd "$A" && make fclean >/dev/null 2>&1)
+	if ls "$A"/*.o "$A"/libft.a >/dev/null 2>&1; then
+		audit_line ko "fclean removes .o files and libft.a"
+	else audit_line ok "fclean removes .o files and libft.a"; fi
+	(cd "$A" && make re >/dev/null 2>&1)
+	if [ -f "$A/libft.a" ]; then audit_line ok "re rebuilds everything"
+	else audit_line ko "re rebuilds everything"; fi
+
+	if ! grep -qE '^#[[:space:]]*ifndef' "$ROOT/libft.h"; then
+		audit_line ko "libft.h: include guard"
+	elif grep -q 't_list' "$ROOT/libft.h"; then
+		audit_line ok "libft.h: include guard and t_list"
+	else
+		audit_line ok "libft.h: include guard" "t_list not declared yet (needed for part 3)"
+	fi
+
+	bad="$(cd "$ROOT" && { git ls-files 2>/dev/null || ls -A; } \
+		| grep -vE '^(ft_[a-z_0-9]+\.c|libft\.h|Makefile|README\.md|\.gitignore)$')"
+	if [ -z "$bad" ]; then
+		audit_line ok "no useless files in the repository"
+	else
+		audit_line warn "no useless files in the repository (subject: forbidden)" \
+			"$(echo $bad | cut -c1-100)" \
+			"keep tests/ and other helpers out of the version you submit"
+	fi
+
+	if command -v norminette >/dev/null 2>&1; then
+		out="$(cd "$ROOT" && norminette ft_*.c libft.h 2>&1 | grep -c 'Error')"
+		if [ "$out" = 0 ]; then audit_line ok "norminette: no error"
+		else
+			audit_line ko "norminette: $out error(s)" \
+				"$(cd "$ROOT" && norminette ft_*.c libft.h 2>&1 | grep -A1 -m1 'Error!' | tr '\n' ' ' | cut -c1-100)"
+		fi
+	else audit_line warn "norminette not installed: not checked"; fi
+}
+
+[ ${#SELECT[@]} -eq 0 ] && [ "$NOAUDIT" != 1 ] && run_audit
+
 # ------------------------------- summary ------------------------------------
-bad=$((n_ko + n_crash + n_leak + n_ub + n_time + n_build))
+bad=$((n_ko + n_crash + n_leak + n_ub + n_time + n_build + n_audit_ko))
 printf '\n  %s' "$D"; rule 58; printf '%s\n'  "$R"
 printf '\n  %s\n\n' "$bar"
 printf '  %s%d passed%s' "$F_OK$B" "$n_ok" "$R"
@@ -261,6 +386,8 @@ printf '  %s%d passed%s' "$F_OK$B" "$n_ok" "$R"
 [ "$n_time" -gt 0 ] && printf '   %s%d timeout%s' "$F_LK$B" "$n_time" "$R"
 [ "$n_build" -gt 0 ] && printf '   %s%d not building%s' "$F_KO$B" "$n_build" "$R"
 [ "$n_skip" -gt 0 ] && printf '   %s%d not written yet%s' "$D" "$n_skip" "$R"
+[ "$n_audit_ko" -gt 0 ] && printf '   %s%d audit failed%s' "$F_KO$B" "$n_audit_ko" "$R"
+[ "$n_audit_warn" -gt 0 ] && printf '   %s%d audit warning(s)%s' "$F_LK$B" "$n_audit_warn" "$R"
 printf '   %s(%d functions)%s\n' "$D" "$total" "$R"
 if [ "$bad" -eq 0 ]; then
 	printf '\n  %s%sEverything written so far is clean: logic, memory, leaks.%s\n\n' "$F_OK" "$B" "$R"
