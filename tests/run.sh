@@ -307,7 +307,7 @@ run_audit() {
 	out="$(cd "$A" && make 2>&1)"
 	if [ ! -f "$A/libft.a" ]; then
 		audit_line ko "make builds libft.a at the root" \
-			"$(echo "$out" | grep -m2 -E 'error|Error|\*\*\*' | cut -c1-90)"
+			"$(echo "$out" | grep -m2 -E '\*\*\*|No rule|error:' | cut -c1-90)"
 		return
 	fi
 	audit_line ok "make builds libft.a at the root"
