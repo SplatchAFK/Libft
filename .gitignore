@@ -2,3 +2,5 @@ subject.pdf
 *.o
 *.txt
 a.out
+subject/
+tests/
