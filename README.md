@@ -15,12 +15,6 @@ make
 
 Génère `libft.a` à la racine. Autres règles : `make clean`, `make fclean`, `make re`.
 
-Pour l'utiliser dans un autre projet :
-
-```bash
-cc main.c -L. -lft -o mon_programme
-```
-
 ## 📎 Ressources
 
 - Pages de manuel (`man strlen`, `man memcpy`, `man ar`), documentation de `make`.
